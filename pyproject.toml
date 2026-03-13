@@ -1,0 +1,9 @@
+[build-system]
+requires = ["maturin>=1.4"]
+build-backend = "maturin"
+
+[project]
+name = "xlsx-chart-extractor"
+version = "0.1.0"
+description = "High performance Excel chart metadata extractor"
+requires-python = ">=3.8"

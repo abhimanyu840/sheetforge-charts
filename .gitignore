@@ -1,0 +1,31 @@
+# ── Rust ─────────────────────────────────────────────────────────────────────
+/target/
+Cargo.lock          # omit for libraries (include for binaries/applications)
+
+# ── Criterion benchmark output ────────────────────────────────────────────────
+/criterion/
+
+# ── Python bindings (maturin) ─────────────────────────────────────────────────
+*.so
+*.pyd
+__pycache__/
+*.py[cod]
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# ── Node.js bindings (napi-rs) ────────────────────────────────────────────────
+node_modules/
+*.node
+npm-debug.log*
+yarn-error.log*
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

@@ -1,0 +1,88 @@
+[package]
+name = "sheetforge-charts"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance library for extracting chart metadata from Excel (.xlsx) files"
+license = "MIT"
+repository = "https://github.com/your-org/sheetforge-charts"
+
+# Ensure the library can be consumed as a Rust crate,
+# and later wrapped by PyO3 (Python) and napi-rs / wasm-bindgen (JS/TS).
+[lib]
+name = "sheetforge_charts"
+crate-type = [
+    "lib",     # normal Rust consumers
+    "cdylib",  # needed by PyO3 and napi-rs for native extensions
+]
+
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+
+[[bench]]
+name    = "chart_extraction"
+harness = false   # use Criterion's own harness
+
+# ── Core dependencies ────────────────────────────────────────────────────────
+
+[dependencies]
+# ZIP archive reading (XLSX is a ZIP under the hood)
+zip = "2"
+
+# Streaming XML parser — zero-copy, low-allocations
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Serialization / deserialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Ergonomic error handling
+anyhow = "1"
+
+# Data-parallel iteration — used to parse chart XML concurrently
+rayon = "1.10"
+
+# ── Dev dependencies ─────────────────────────────────────────────────────────
+
+[dev-dependencies]
+# For integration tests that read real .xlsx fixtures
+tempfile = "3"
+
+# Benchmarking framework
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── Feature flags (Phase 2/3 bindings, off by default) ───────────────────────
+
+[features]
+default = []
+
+# Activate when building the Python extension with maturin
+python = ["dep:pyo3"]
+
+# Activate when building the Node.js extension with napi-rs
+nodejs = ["dep:napi", "dep:napi-derive"]
+
+[dependencies.pyo3]
+version  = "0.21"
+features = ["extension-module"]
+optional = true
+
+[dependencies.napi]
+version  = "2"
+optional = true
+
+[dependencies.napi-derive]
+version  = "2"
+optional = true
+
+# ── Compiler optimisations ────────────────────────────────────────────────────
+
+[profile.release]
+opt-level     = 3
+lto           = true   # link-time optimisation — critical for cdylib size
+codegen-units = 1      # maximise inlining across the whole crate
+strip         = true   # strip debug symbols from the final .so / .dll
+
+# Benchmarks run in release-like mode so the numbers reflect real performance.
+[profile.bench]
+opt-level     = 3
+lto           = "thin"  # thin LTO: fast enough for bench builds
+codegen-units = 4
