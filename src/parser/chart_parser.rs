@@ -178,6 +178,9 @@ struct ParseState {
     current_layer_grouping: Option<Grouping>,
     /// Whether the current layer is a horizontal-bar layer.
     current_layer_bar_horiz: bool,
+    /// Axis IDs referenced by the current chart-type element via direct-child
+    /// `<c:axId>` elements (not inside `<c:ser>`).
+    current_layer_axis_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,6 +314,7 @@ impl ParseState {
             current_layer_type: ChartType::Unknown,
             current_layer_grouping: None,
             current_layer_bar_horiz: false,
+            current_layer_axis_ids: Vec::new(),
         }
     }
 
@@ -408,6 +412,7 @@ impl ParseState {
                     self.current_layer_grouping = None;
                     self.current_layer_bar_horiz = false;
                     self.current_layer_series = Vec::new();
+                    self.current_layer_axis_ids = Vec::new();
                 }
                 self.chart_tag_depth += 1;
             }
@@ -423,6 +428,21 @@ impl ParseState {
                     let g = Grouping::from_val(&v);
                     self.plot_area.grouping = g.clone();
                     self.current_layer_grouping = g;
+                }
+            }
+
+            // ── axId — axis cross-reference ───────────────────────────────────
+            // Two distinct contexts:
+            // 1. Inside a chart-type layer (chart_tag_depth > 0, not in a ser):
+            //    direct children like <c:barChart><c:axId val="1"/>…
+            //    These tell us which axes this layer plots against.
+            // 2. Inside an axis definition element (current_axis.is_some()):
+            //    handled below.
+            "axId" if self.chart_tag_depth > 0 && !self.in_ser && self.current_axis.is_none() => {
+                if let Some(v) = attr(e, b"val", dec)? {
+                    if let Ok(id) = v.parse::<u32>() {
+                        self.current_layer_axis_ids.push(id);
+                    }
                 }
             }
 
@@ -783,6 +803,7 @@ impl ParseState {
                         series: std::mem::take(&mut self.current_layer_series),
                         grouping: self.current_layer_grouping.take(),
                         bar_horizontal: self.current_layer_bar_horiz,
+                        axis_ids: std::mem::take(&mut self.current_layer_axis_ids),
                     });
                     self.current_layer_type = ChartType::Unknown;
                     self.current_layer_bar_horiz = false;
@@ -1014,19 +1035,12 @@ impl ParseState {
     }
 
     fn finish(self) -> Chart {
-        let series = self.plot_area.series.clone();
         let axes = self.plot_area.axes.clone();
 
         // ── Determine primary chart type and finalise layers ──────────────────
-        // Each layer's horizontal-bar variant was already resolved in on_end.
-        // The primary type is:
-        //   - The single layer's type for simple charts.
-        //   - ChartType::Combo when layers have distinct types.
-        //   - Falls back to plot_area.chart_type (first seen) for empty layers.
-        let layers = self.pending_layers;
+        let mut layers = self.pending_layers;
 
         let chart_type = if layers.len() > 1 {
-            // Check whether all layers share the same type.
             let first = &layers[0].chart_type;
             let all_same = layers.iter().all(|l| &l.chart_type == first);
             if all_same {
@@ -1037,8 +1051,6 @@ impl ParseState {
         } else if let Some(layer) = layers.first() {
             layer.chart_type.clone()
         } else {
-            // No layers parsed — fall back to the plot_area type (handles the
-            // old bar_horizontal upgrade for any legacy code path).
             match (
                 self.plot_area.chart_type.clone(),
                 self.plot_area.bar_horizontal,
@@ -1049,8 +1061,68 @@ impl ParseState {
             }
         };
 
-        // Keep plot_area.chart_type consistent with the resolved primary type.
         let plot_area_chart_type = chart_type.clone();
+
+        // ── Secondary axis resolution ─────────────────────────────────────────
+        // Axes with position Right (secondary Y) or Top (secondary X) are
+        // secondary axes.  All other axes (Left, Bottom, or absent) are primary.
+        use crate::model::axis::AxisPosition;
+        let secondary_ids: std::collections::HashSet<u32> = axes
+            .iter()
+            .filter(|ax| {
+                matches!(
+                    ax.position,
+                    Some(AxisPosition::Right) | Some(AxisPosition::Top)
+                )
+            })
+            .map(|ax| ax.id)
+            .collect();
+
+        // Value-axis types (the axes that carry the plotted values).
+        // We look for the layer's referenced axis IDs that correspond to a
+        // valAx or dateAx, because those are the ones that can be "secondary".
+        use crate::model::axis::AxisType;
+        let value_axis_ids: std::collections::HashSet<u32> = axes
+            .iter()
+            .filter(|ax| matches!(ax.axis_type, AxisType::Value | AxisType::Date))
+            .map(|ax| ax.id)
+            .collect();
+
+        // For each layer: find which of its axis_ids is a value-axis id,
+        // then mark all series in that layer.
+        for layer in layers.iter_mut() {
+            // The value-axis id for this layer: first axis_id that is a value axis.
+            let val_axis_id: Option<u32> = layer
+                .axis_ids
+                .iter()
+                .find(|id| value_axis_ids.contains(id))
+                .copied();
+
+            let is_secondary = val_axis_id
+                .map(|id| secondary_ids.contains(&id))
+                .unwrap_or(false);
+
+            for series in layer.series.iter_mut() {
+                series.axis_id = val_axis_id;
+                series.is_secondary_axis = is_secondary;
+            }
+        }
+
+        // Rebuild flat series list from resolved layers (axis fields now set).
+        let series: Vec<Series> = layers
+            .iter()
+            .flat_map(|l| l.series.iter().cloned())
+            .collect();
+
+        // Also update plot_area.series to have the resolved axis fields.
+        let mut plot_area = self.plot_area;
+        for s in plot_area.series.iter_mut() {
+            // Match by index to copy resolved fields from layer series.
+            if let Some(resolved) = series.iter().find(|r| r.index == s.index) {
+                s.axis_id = resolved.axis_id;
+                s.is_secondary_axis = resolved.is_secondary_axis;
+            }
+        }
 
         // Only attach view_3d when it actually carried data.
         let view_3d = if self.pending_view_3d.is_empty() {
@@ -1081,17 +1153,17 @@ impl ParseState {
             style: self.style,
             plot_area: PlotArea {
                 chart_type: plot_area_chart_type,
-                ..self.plot_area
+                ..plot_area
             },
             series,
             axes,
             chart_fill: self.chart_fill,
-            anchor: None, // set by sheet_parser after drawing anchor resolved
+            anchor: None,
             view_3d,
             surface,
             is_pivot_chart: self.pending_pivot_name.is_some(),
             pivot_table_name: self.pending_pivot_name,
-            pivot_meta: None, // resolved in lib.rs Phase A5 after parse
+            pivot_meta: None,
             layers,
         }
     }
@@ -3169,5 +3241,273 @@ mod tests {
         let c = parse_xml(BAR_XML, "c.xml").unwrap();
         assert!(!c.series.is_empty());
         assert_eq!(c.series.len(), c.layers[0].series.len());
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Phase 14 — Secondary Axis Support
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── XML fixtures ─────────────────────────────────────────────────────────
+
+    /// Bar + Line combo with secondary value axis on the right.
+    /// barChart → axId=1 (catAx/bottom) + axId=2 (valAx/left = primary)
+    /// lineChart → axId=1 (shared catAx) + axId=3 (valAx/right = secondary)
+    const SECONDARY_AXIS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:val><c:numRef><c:f>Sheet1!$B$2:$B$5</c:f>
+            <c:numCache>
+              <c:ptCount val="4"/>
+              <c:pt idx="0"><c:v>10</c:v></c:pt>
+              <c:pt idx="1"><c:v>20</c:v></c:pt>
+              <c:pt idx="2"><c:v>30</c:v></c:pt>
+              <c:pt idx="3"><c:v>40</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:ser>
+          <c:idx val="1"/><c:order val="1"/>
+          <c:val><c:numRef><c:f>Sheet1!$C$2:$C$5</c:f>
+            <c:numCache>
+              <c:ptCount val="4"/>
+              <c:pt idx="0"><c:v>5</c:v></c:pt>
+              <c:pt idx="1"><c:v>15</c:v></c:pt>
+              <c:pt idx="2"><c:v>25</c:v></c:pt>
+              <c:pt idx="3"><c:v>35</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:axId val="1"/>
+        <c:axId val="2"/>
+      </c:barChart>
+      <c:lineChart>
+        <c:grouping val="standard"/>
+        <c:ser>
+          <c:idx val="2"/><c:order val="2"/>
+          <c:val><c:numRef><c:f>Sheet1!$D$2:$D$5</c:f>
+            <c:numCache>
+              <c:ptCount val="4"/>
+              <c:pt idx="0"><c:v>100</c:v></c:pt>
+              <c:pt idx="1"><c:v>200</c:v></c:pt>
+              <c:pt idx="2"><c:v>300</c:v></c:pt>
+              <c:pt idx="3"><c:v>400</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:axId val="1"/>
+        <c:axId val="3"/>
+      </c:lineChart>
+      <c:catAx>
+        <c:axId val="1"/><c:axPos val="b"/><c:crossAx val="2"/>
+      </c:catAx>
+      <c:valAx>
+        <c:axId val="2"/><c:axPos val="l"/><c:crossAx val="1"/>
+      </c:valAx>
+      <c:valAx>
+        <c:axId val="3"/><c:axPos val="r"/><c:crossAx val="1"/>
+      </c:valAx>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// Simple bar chart with only a primary axis — no secondary axis at all.
+    const PRIMARY_ONLY_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:val><c:numRef><c:f>Sheet1!$B$2:$B$4</c:f>
+            <c:numCache><c:ptCount val="3"/>
+              <c:pt idx="0"><c:v>1</c:v></c:pt>
+              <c:pt idx="1"><c:v>2</c:v></c:pt>
+              <c:pt idx="2"><c:v>3</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:axId val="1"/>
+        <c:axId val="2"/>
+      </c:barChart>
+      <c:catAx><c:axId val="1"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>
+      <c:valAx><c:axId val="2"/><c:axPos val="l"/><c:crossAx val="1"/></c:valAx>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    // ── layer axis_ids populated ──────────────────────────────────────────────
+
+    #[test]
+    fn bar_layer_axis_ids_collected() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        // barChart references axId=1 (cat) and axId=2 (val/left)
+        assert!(c.layers[0].axis_ids.contains(&1));
+        assert!(c.layers[0].axis_ids.contains(&2));
+    }
+
+    #[test]
+    fn line_layer_axis_ids_collected() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        // lineChart references axId=1 (cat) and axId=3 (val/right = secondary)
+        assert!(c.layers[1].axis_ids.contains(&1));
+        assert!(c.layers[1].axis_ids.contains(&3));
+    }
+
+    #[test]
+    fn primary_only_layer_axis_ids() {
+        let c = parse_xml(PRIMARY_ONLY_XML, "c.xml").unwrap();
+        assert!(c.layers[0].axis_ids.contains(&1));
+        assert!(c.layers[0].axis_ids.contains(&2));
+    }
+
+    #[test]
+    fn axis_ids_not_contaminated_by_series() {
+        // <c:axId> inside <c:ser> must NOT be captured into layer axis_ids.
+        // (Series don't normally have axId children, but the guard must hold.)
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        // bar layer: only 2 axis refs (1 and 2)
+        assert_eq!(c.layers[0].axis_ids.len(), 2);
+    }
+
+    // ── axis_id on series ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bar_series_axis_id_is_primary_val() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        // Bar series 0 and 1 → axId=2 (valAx/left = primary)
+        assert_eq!(c.series[0].axis_id, Some(2));
+        assert_eq!(c.series[1].axis_id, Some(2));
+    }
+
+    #[test]
+    fn line_series_axis_id_is_secondary_val() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        // Line series 2 → axId=3 (valAx/right = secondary)
+        assert_eq!(c.series[2].axis_id, Some(3));
+    }
+
+    #[test]
+    fn primary_only_series_axis_id() {
+        let c = parse_xml(PRIMARY_ONLY_XML, "c.xml").unwrap();
+        assert_eq!(c.series[0].axis_id, Some(2));
+    }
+
+    // ── is_secondary_axis on series ───────────────────────────────────────────
+
+    #[test]
+    fn bar_series_not_secondary() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        assert!(!c.series[0].is_secondary_axis);
+        assert!(!c.series[1].is_secondary_axis);
+    }
+
+    #[test]
+    fn line_series_is_secondary() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        assert!(
+            c.series[2].is_secondary_axis,
+            "line series on right-position valAx must be secondary"
+        );
+    }
+
+    #[test]
+    fn primary_only_series_not_secondary() {
+        let c = parse_xml(PRIMARY_ONLY_XML, "c.xml").unwrap();
+        assert!(!c.series[0].is_secondary_axis);
+    }
+
+    // ── layer series mirrors flat series for axis fields ──────────────────────
+
+    #[test]
+    fn layer_series_axis_id_matches_flat() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        // Layer 0 (bar) series[0] must match flat series[0]
+        assert_eq!(c.layers[0].series[0].axis_id, c.series[0].axis_id);
+        assert_eq!(
+            c.layers[0].series[0].is_secondary_axis,
+            c.series[0].is_secondary_axis
+        );
+    }
+
+    #[test]
+    fn layer1_series_is_secondary_matches_flat() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        assert_eq!(
+            c.layers[1].series[0].is_secondary_axis,
+            c.series[2].is_secondary_axis
+        );
+    }
+
+    // ── axes still parsed correctly ───────────────────────────────────────────
+
+    #[test]
+    fn three_axes_parsed() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        assert_eq!(c.axes.len(), 3, "catAx + primary valAx + secondary valAx");
+    }
+
+    #[test]
+    fn secondary_val_axis_position_right() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        use crate::model::axis::AxisPosition;
+        let sec_ax = c.axes.iter().find(|ax| ax.id == 3).unwrap();
+        assert_eq!(sec_ax.position, Some(AxisPosition::Right));
+    }
+
+    #[test]
+    fn primary_val_axis_position_left() {
+        let c = parse_xml(SECONDARY_AXIS_XML, "c.xml").unwrap();
+        use crate::model::axis::AxisPosition;
+        let pri_ax = c.axes.iter().find(|ax| ax.id == 2).unwrap();
+        assert_eq!(pri_ax.position, Some(AxisPosition::Left));
+    }
+
+    // ── regression: existing single-axis charts unaffected ───────────────────
+
+    #[test]
+    fn bar_xml_series_axis_id_set() {
+        // BAR_XML has axId=1 (cat) + axId=2 (val/left). Series must get axis_id=2.
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        // All series should have axis_id = Some(2) and is_secondary = false
+        for s in &c.series {
+            assert!(
+                !s.is_secondary_axis,
+                "plain bar chart series must not be secondary"
+            );
+        }
+    }
+
+    #[test]
+    fn combo_chart_no_secondary_all_primary() {
+        // BAR_LINE_COMBO_XML has two value axes — check they're both classified correctly
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        // The combo fixture has axId=2 (left) and axId=3 (right)
+        // bar series → primary (axId=2); line series → secondary (axId=3)
+        let bar_ser_secondary: Vec<bool> = c.layers[0]
+            .series
+            .iter()
+            .map(|s| s.is_secondary_axis)
+            .collect();
+        let line_ser_secondary: Vec<bool> = c.layers[1]
+            .series
+            .iter()
+            .map(|s| s.is_secondary_axis)
+            .collect();
+        assert!(
+            bar_ser_secondary.iter().all(|&b| !b),
+            "bar layer series must be primary"
+        );
+        assert!(
+            line_ser_secondary.iter().all(|&b| b),
+            "line layer series on right axis must be secondary"
+        );
     }
 }

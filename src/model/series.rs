@@ -172,6 +172,28 @@ pub struct Series {
     /// Fill applied to this series bar/marker/slice, parsed from `<c:spPr>`.
     /// `None` means Excel uses its automatic series color (theme accent cycle).
     pub fill: Option<Fill>,
+
+    // ── Axis association ──────────────────────────────────────────────────────
+    /// The numeric ID of the value (or date) axis this series plots against.
+    ///
+    /// Set during [`crate::parser::chart_parser`] `finish()` by examining the
+    /// `<c:axId>` elements inside the series' chart-type element and matching
+    /// them against the parsed [`crate::model::axis::Axis`] list.
+    ///
+    /// `None` when:
+    /// * The chart has no axes (e.g. pie charts), or
+    /// * The axis ID could not be resolved (malformed XML).
+    pub axis_id: Option<u32>,
+
+    /// `true` when this series is plotted against the **secondary** value axis.
+    ///
+    /// A value axis is considered secondary when its
+    /// [`crate::model::axis::AxisPosition`] is `Right` (secondary Y) or
+    /// `Top` (secondary X).  Primary axes use `Left` (Y) or `Bottom` (X).
+    ///
+    /// This field is always `false` when [`axis_id`](Series::axis_id) is
+    /// `None`.
+    pub is_secondary_axis: bool,
 }
 
 impl Series {
@@ -193,6 +215,8 @@ impl Series {
             bubble_size_ref: None,
             bubble_size_cache: None,
             fill: None,
+            axis_id: None,
+            is_secondary_axis: false,
         }
     }
 
@@ -205,5 +229,54 @@ impl Series {
     /// Returns `true` when category labels can be read from cache.
     pub fn has_category_cache(&self) -> bool {
         self.category_cache_state == CacheState::Complete
+    }
+
+    /// Returns `true` when this series is plotted on the secondary axis.
+    ///
+    /// Convenience wrapper around [`is_secondary_axis`](Series::is_secondary_axis).
+    pub fn is_on_secondary_axis(&self) -> bool {
+        self.is_secondary_axis
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_series_axis_id_is_none() {
+        let s = Series::new(0);
+        assert!(s.axis_id.is_none());
+    }
+
+    #[test]
+    fn new_series_is_secondary_false() {
+        let s = Series::new(0);
+        assert!(!s.is_secondary_axis);
+    }
+
+    #[test]
+    fn is_on_secondary_axis_matches_field() {
+        let mut s = Series::new(0);
+        assert!(!s.is_on_secondary_axis());
+        s.is_secondary_axis = true;
+        assert!(s.is_on_secondary_axis());
+    }
+
+    #[test]
+    fn axis_id_roundtrip() {
+        let mut s = Series::new(0);
+        s.axis_id = Some(42);
+        assert_eq!(s.axis_id, Some(42));
+    }
+
+    #[test]
+    fn secondary_false_when_axis_id_none() {
+        let s = Series::new(0);
+        // By invariant: is_secondary_axis is false when axis_id is None
+        assert!(s.axis_id.is_none());
+        assert!(!s.is_secondary_axis);
     }
 }

@@ -272,6 +272,14 @@ fn main() {
                         if let Some(cats) = &s.category_values {
                             println!("  │         cat vals : {:?}", cats.values);
                         }
+                        // Axis association (Phase 14)
+                        println!(
+                            "  │         axis_id  : {}  secondary={}",
+                            s.axis_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "—".into()),
+                            s.is_secondary_axis,
+                        );
                         // Fill
                         println!(
                             "  │         fill     : {}",
@@ -296,7 +304,7 @@ fn main() {
             }
 
             println!("\n{}", "─".repeat(70));
-            println!("Done (Phases 1–13).");
+            println!("Done (Phases 1–14).");
         }
     }
 }

@@ -329,6 +329,13 @@ pub struct ChartLayer {
     pub grouping: Option<Grouping>,
     /// `true` when this is a horizontal-bar layer (`<c:barDir val="bar"/>`).
     pub bar_horizontal: bool,
+    /// Axis IDs referenced by this layer, from `<c:axId val="N"/>` elements
+    /// that are **direct children of the chart-type element** (not inside
+    /// `<c:ser>`).  Typically two entries: category-axis ID and value-axis ID.
+    ///
+    /// Used to determine which axes each series in this layer plots against,
+    /// and therefore whether they are on the primary or secondary axis.
+    pub axis_ids: Vec<u32>,
 }
 
 // ── PlotArea ─────────────────────────────────────────────────────────────────
@@ -609,6 +616,7 @@ mod chart_type_tests {
             series: vec![],
             grouping: Some(Grouping::Clustered),
             bar_horizontal: false,
+            axis_ids: vec![],
         };
         assert_eq!(layer.chart_type, ChartType::Bar);
         assert!(layer.series.is_empty());
@@ -622,6 +630,7 @@ mod chart_type_tests {
             series: vec![],
             grouping: None,
             bar_horizontal: true,
+            axis_ids: vec![1, 2],
         };
         assert!(layer.bar_horizontal);
     }

@@ -2191,3 +2191,236 @@ fn pivot_chart_one_layer() {
         }
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 14 — Secondary Axis Support
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Fixture: test_secondary_axis.xlsx
+//   Sheet "SecondaryAxis" → chart1.xml  barChart (2 ser, axId=2/left primary)
+//                                     + lineChart (1 ser, axId=3/right secondary)
+//   Sheet "PrimaryOnly"  → chart2.xml  barChart (2 ser, primary only)
+//   Sheet "TwinValue"    → chart3.xml  barChart (2 ser, primary only)
+
+fn fixture_secondary() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/test_secondary_axis.xlsx")
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ── Workbook structure ────────────────────────────────────────────────────────
+
+#[test]
+fn secondary_fixture_has_three_sheets() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert_eq!(wb.sheets.len(), 3);
+}
+
+#[test]
+fn secondary_fixture_sheet_names() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["SecondaryAxis", "PrimaryOnly", "TwinValue"]);
+}
+
+// ── chart_type == Combo ───────────────────────────────────────────────────────
+
+#[test]
+fn secondary_chart_is_combo() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].chart_type, ChartType::Combo);
+}
+
+#[test]
+fn primary_only_chart_is_bar() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].chart_type, ChartType::Bar);
+}
+
+// ── axis counts ───────────────────────────────────────────────────────────────
+
+#[test]
+fn secondary_chart_has_three_axes() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    // catAx(id=1) + valAx(id=2, left) + valAx(id=3, right)
+    assert_eq!(wb.sheets[0].charts[0].axes.len(), 3);
+}
+
+#[test]
+fn primary_only_has_two_axes() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].axes.len(), 2);
+}
+
+// ── secondary axis position ───────────────────────────────────────────────────
+
+#[test]
+fn secondary_val_axis_position_right() {
+    use sheetforge_charts::model::axis::AxisPosition;
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let axes = &wb.sheets[0].charts[0].axes;
+    let sec_ax = axes
+        .iter()
+        .find(|ax| ax.id == 3)
+        .expect("axis id=3 must exist");
+    assert_eq!(sec_ax.position, Some(AxisPosition::Right));
+}
+
+#[test]
+fn primary_val_axis_position_left() {
+    use sheetforge_charts::model::axis::AxisPosition;
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let axes = &wb.sheets[0].charts[0].axes;
+    let pri_ax = axes
+        .iter()
+        .find(|ax| ax.id == 2)
+        .expect("axis id=2 must exist");
+    assert_eq!(pri_ax.position, Some(AxisPosition::Left));
+}
+
+// ── series flat list ──────────────────────────────────────────────────────────
+
+#[test]
+fn secondary_chart_has_three_series() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].series.len(), 3);
+}
+
+// ── axis_id on series ─────────────────────────────────────────────────────────
+
+#[test]
+fn bar_series0_axis_id_primary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let s = &wb.sheets[0].charts[0].series[0];
+    assert_eq!(
+        s.axis_id,
+        Some(2),
+        "bar series 0 must reference primary val axis id=2"
+    );
+}
+
+#[test]
+fn bar_series1_axis_id_primary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let s = &wb.sheets[0].charts[0].series[1];
+    assert_eq!(s.axis_id, Some(2));
+}
+
+#[test]
+fn line_series_axis_id_secondary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let s = &wb.sheets[0].charts[0].series[2];
+    assert_eq!(
+        s.axis_id,
+        Some(3),
+        "line series must reference secondary val axis id=3"
+    );
+}
+
+// ── is_secondary_axis on series ───────────────────────────────────────────────
+
+#[test]
+fn bar_series0_not_secondary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert!(!wb.sheets[0].charts[0].series[0].is_secondary_axis);
+}
+
+#[test]
+fn bar_series1_not_secondary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert!(!wb.sheets[0].charts[0].series[1].is_secondary_axis);
+}
+
+#[test]
+fn line_series_is_secondary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].series[2].is_secondary_axis,
+        "line series on right-position axis must be secondary"
+    );
+}
+
+// ── is_on_secondary_axis() convenience method ─────────────────────────────────
+
+#[test]
+fn is_on_secondary_axis_method_true() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert!(wb.sheets[0].charts[0].series[2].is_on_secondary_axis());
+}
+
+#[test]
+fn is_on_secondary_axis_method_false() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert!(!wb.sheets[0].charts[0].series[0].is_on_secondary_axis());
+}
+
+// ── layer axis_ids ────────────────────────────────────────────────────────────
+
+#[test]
+fn bar_layer_axis_ids() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let ids = &wb.sheets[0].charts[0].layers[0].axis_ids;
+    assert!(ids.contains(&1), "barChart must ref catAx id=1");
+    assert!(ids.contains(&2), "barChart must ref primary valAx id=2");
+}
+
+#[test]
+fn line_layer_axis_ids() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let ids = &wb.sheets[0].charts[0].layers[1].axis_ids;
+    assert!(ids.contains(&1), "lineChart must ref catAx id=1");
+    assert!(ids.contains(&3), "lineChart must ref secondary valAx id=3");
+}
+
+// ── layer series mirrors axis fields ─────────────────────────────────────────
+
+#[test]
+fn bar_layer_series_match_flat() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    for ls in &chart.layers[0].series {
+        let fs = chart.series.iter().find(|s| s.index == ls.index).unwrap();
+        assert_eq!(ls.axis_id, fs.axis_id);
+        assert_eq!(ls.is_secondary_axis, fs.is_secondary_axis);
+    }
+}
+
+#[test]
+fn line_layer_series_is_secondary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    assert!(wb.sheets[0].charts[0].layers[1].series[0].is_secondary_axis);
+}
+
+// ── regression: primary-only charts unaffected ───────────────────────────────
+
+#[test]
+fn primary_only_series_not_secondary() {
+    let wb = extract_charts(&fixture_secondary()).unwrap();
+    for s in &wb.sheets[1].charts[0].series {
+        assert!(
+            !s.is_secondary_axis,
+            "primary-only chart must have no secondary series"
+        );
+    }
+}
+
+#[test]
+fn original_sales_chart_series_not_secondary() {
+    let wb = extract_charts(&fixture()).unwrap();
+    for s in &wb.sheets[0].charts[0].series {
+        assert!(!s.is_secondary_axis);
+    }
+}
+
+#[test]
+fn combo_fixture_primary_series_not_secondary() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    // combo fixture bar layer: primary (left axis)
+    for s in &wb.sheets[0].charts[0].layers[0].series {
+        assert!(
+            !s.is_secondary_axis,
+            "bar layer in combo fixture must be primary"
+        );
+    }
+}
