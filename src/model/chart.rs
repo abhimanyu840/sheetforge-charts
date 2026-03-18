@@ -343,6 +343,20 @@ pub struct Chart {
     /// 3-D chart, extracted from `<c:floor>`, `<c:sideWall>`, `<c:backWall>`.
     /// `None` when all three elements are absent or carry no `<c:spPr>`.
     pub surface: Option<Chart3DSurface>,
+
+    /// `true` when `<c:pivotSource>` is present in the chart XML.
+    ///
+    /// Pivot charts are backed by a PivotTable rather than a direct worksheet
+    /// range.  Their series references point into the PivotTable cache instead
+    /// of raw cell ranges, so value resolution requires the pivot cache.
+    pub is_pivot_chart: bool,
+
+    /// The pivot table name from `<c:pivotSource><c:name>…</c:name>`.
+    ///
+    /// Excel writes this as `"SheetName!PivotTableName"` (e.g.
+    /// `"Sheet1!PivotTable1"`).  `None` when [`is_pivot_chart`](Chart::is_pivot_chart)
+    /// is `false`.
+    pub pivot_table_name: Option<String>,
 }
 
 impl Chart {
@@ -360,6 +374,8 @@ impl Chart {
             anchor: None,
             view_3d: None,
             surface: None,
+            is_pivot_chart: false,
+            pivot_table_name: None,
         }
     }
 }
@@ -500,5 +516,17 @@ mod chart_type_tests {
             ..Default::default()
         };
         assert!(!s.is_empty());
+    }
+
+    // Chart pivot fields — defaults
+    #[test]
+    fn chart_not_pivot_by_default() {
+        let c = Chart::new_skeleton("xl/charts/chart1.xml");
+        assert!(!c.is_pivot_chart);
+    }
+    #[test]
+    fn chart_pivot_name_none_by_default() {
+        let c = Chart::new_skeleton("xl/charts/chart1.xml");
+        assert!(c.pivot_table_name.is_none());
     }
 }

@@ -1,4 +1,4 @@
-//! Integration tests — Phases 1–9.
+//! Integration tests — Phases 1–10.
 //!
 //! Fixtures:
 //!   tests/fixtures/test_charts.xlsx      (Phases 1–7, 2-D charts)
@@ -21,6 +21,11 @@
 //!                                          backWall gradient #FF0000→#FFFFFF linear 90°
 //!     Sheet "FloorOnly"      → chart2.xml  floor solid #FF0000; sideWall+backWall absent
 //!     Sheet "NoFillSurfaces" → chart3.xml  all three surfaces carry explicit <a:noFill/>
+//!
+//!   tests/fixtures/test_pivot_charts.xlsx  (Phase 10, pivot chart detection)
+//!     Sheet "PivotChart"  → chart1.xml  bar chart + <pivotSource> "Sheet1!PivotTable1"
+//!     Sheet "NoPivot"     → chart2.xml  bar chart, no <pivotSource>
+//!     Sheet "MultiPivot"  → chart3.xml  bar chart + <pivotSource> "Sales!RevenueByRegion"
 
 use sheetforge_charts::{
     extract_charts,
@@ -593,7 +598,7 @@ fn non_zip_file_returns_error() {
 //   5   HBar3D      c:bar3DChart        bar      20    15     1     (none)
 // ═════════════════════════════════════════════════════════════════════════════
 
-use sheetforge_charts::model::chart::Chart3DView;
+// use sheetforge_charts::model::chart::Chart3DView;
 
 fn fixture_3d() -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1318,4 +1323,225 @@ fn floor_only_surface_is_not_empty() {
     let wb = extract_charts(&fixture_surface()).unwrap();
     let surf = wb.sheets[1].charts[0].surface.as_ref().unwrap();
     assert!(!surf.is_empty());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 10 — Pivot chart detection
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn fixture_pivot() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/test_pivot_charts.xlsx")
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ── Workbook structure ────────────────────────────────────────────────────────
+
+#[test]
+fn pivot_fixture_has_three_sheets() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets.len(), 3);
+}
+
+#[test]
+fn pivot_fixture_sheet_names() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["PivotChart", "NoPivot", "MultiPivot"]);
+}
+
+#[test]
+fn pivot_fixture_each_sheet_has_one_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    for sheet in &wb.sheets {
+        assert_eq!(
+            sheet.charts.len(),
+            1,
+            "sheet '{}' should have exactly 1 chart",
+            sheet.name
+        );
+    }
+}
+
+// ── is_pivot_chart ────────────────────────────────────────────────────────────
+
+#[test]
+fn pivot_chart_sheet_is_pivot() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].is_pivot_chart,
+        "PivotChart sheet: is_pivot_chart should be true"
+    );
+}
+
+#[test]
+fn no_pivot_sheet_is_not_pivot() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        !wb.sheets[1].charts[0].is_pivot_chart,
+        "NoPivot sheet: is_pivot_chart should be false"
+    );
+}
+
+#[test]
+fn multi_pivot_sheet_is_pivot() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[2].charts[0].is_pivot_chart,
+        "MultiPivot sheet: is_pivot_chart should be true"
+    );
+}
+
+// ── pivot_table_name ──────────────────────────────────────────────────────────
+
+#[test]
+fn pivot_chart_name_correct() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(
+        wb.sheets[0].charts[0].pivot_table_name.as_deref(),
+        Some("Sheet1!PivotTable1")
+    );
+}
+
+#[test]
+fn no_pivot_name_is_none() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(wb.sheets[1].charts[0].pivot_table_name.is_none());
+}
+
+#[test]
+fn multi_pivot_name_correct() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(
+        wb.sheets[2].charts[0].pivot_table_name.as_deref(),
+        Some("Sales!RevenueByRegion")
+    );
+}
+
+// ── other fields unaffected by pivot detection ────────────────────────────────
+
+#[test]
+fn pivot_chart_type_is_bar() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn no_pivot_chart_type_is_bar() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn multi_pivot_chart_type_is_bar() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[2].charts[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn pivot_chart_has_three_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].series.len(), 3);
+}
+
+#[test]
+fn no_pivot_chart_has_three_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].series.len(), 3);
+}
+
+#[test]
+fn pivot_chart_series_have_caches() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    // Every series should have a value cache with 4 data points
+    for s in &chart.series {
+        let cache = s
+            .value_cache
+            .as_ref()
+            .unwrap_or_else(|| panic!("series {} missing value cache", s.index));
+        assert_eq!(
+            cache.values.len(),
+            4,
+            "series {} cache should have 4 values",
+            s.index
+        );
+    }
+}
+
+#[test]
+fn pivot_chart_anchor_present() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].anchor.is_some(),
+        "pivot chart should have an anchor from twoCellAnchor"
+    );
+}
+
+#[test]
+fn no_pivot_chart_anchor_present() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(wb.sheets[1].charts[0].anchor.is_some());
+}
+
+#[test]
+fn pivot_chart_surface_is_none() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].surface.is_none(),
+        "2-D pivot bar chart should have no surface"
+    );
+}
+
+#[test]
+fn pivot_chart_view3d_is_none() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].view_3d.is_none(),
+        "2-D pivot bar chart should have no view_3d"
+    );
+}
+
+// ── regression: existing fixtures unaffected ─────────────────────────────────
+
+#[test]
+fn sales_chart_not_pivot() {
+    // The main 2-D fixture has no pivotSource elements
+    let wb = extract_charts(&fixture()).unwrap();
+    assert!(!wb.sheets[0].charts[0].is_pivot_chart);
+}
+
+#[test]
+fn sales_chart_pivot_name_none() {
+    let wb = extract_charts(&fixture()).unwrap();
+    assert!(wb.sheets[0].charts[0].pivot_table_name.is_none());
+}
+
+#[test]
+fn bar3d_fixture_not_pivot() {
+    let wb = extract_charts(&fixture_3d()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert!(
+                !chart.is_pivot_chart,
+                "3-D fixture chart {} should not be pivot",
+                chart.chart_path
+            );
+        }
+    }
+}
+
+#[test]
+fn surface_fixture_not_pivot() {
+    let wb = extract_charts(&fixture_surface()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert!(
+                !chart.is_pivot_chart,
+                "surface fixture chart {} should not be pivot",
+                chart.chart_path
+            );
+        }
+    }
 }

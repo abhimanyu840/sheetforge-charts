@@ -1,4 +1,4 @@
-//! Manual inspection binary — shows the full Phase 1–9 output.
+//! Manual inspection binary — shows the full Phase 1–10 output.
 //!
 //! Usage:
 //!   cargo run --bin inspect -- tests/fixtures/test_charts.xlsx
@@ -32,10 +32,7 @@ fn main() {
             match &wb.theme {
                 None => println!("Theme  : (none)"),
                 Some(t) => {
-                    println!(
-                        "Theme  : {}",
-                        t.name.as_deref().unwrap_or("(unnamed)")
-                    );
+                    println!("Theme  : {}", t.name.as_deref().unwrap_or("(unnamed)"));
                     for (name, rgb) in t.all_colors() {
                         println!("  {:<10} #{}", name, rgb.to_hex());
                     }
@@ -69,10 +66,23 @@ fn main() {
                     );
                     println!(
                         "  │  style   : {}",
-                        chart.style.map(|s| s.to_string()).unwrap_or_else(|| "(none)".into())
+                        chart
+                            .style
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "(none)".into())
                     );
                     println!("  │  legend  : {:?}", chart.legend_position);
                     println!("  │  grouping: {:?}", chart.plot_area.grouping);
+
+                    // Pivot chart detection (Phase 10)
+                    if chart.is_pivot_chart {
+                        println!(
+                            "  │  pivot   : YES  ({})",
+                            chart.pivot_table_name.as_deref().unwrap_or("name unknown")
+                        );
+                    } else {
+                        println!("  │  pivot   : no");
+                    }
 
                     // Anchor / position
                     match &chart.anchor {
@@ -80,9 +90,12 @@ fn main() {
                         Some(a) => println!(
                             "  │  anchor  : rows {}–{}  cols {}–{}  \
                              (span {} rows × {} cols)",
-                            a.row_start, a.row_end,
-                            a.col_start, a.col_end,
-                            a.row_span(), a.col_span(),
+                            a.row_start,
+                            a.row_end,
+                            a.col_start,
+                            a.col_end,
+                            a.row_span(),
+                            a.col_span(),
                         ),
                     }
 
@@ -94,27 +107,33 @@ fn main() {
                                 println!("  │  3D view :");
                                 match v.rotation_x {
                                     Some(x) => println!("  │    rotX         : {x}°"),
-                                    None    => println!("  │    rotX         : (default)"),
+                                    None => println!("  │    rotX         : (default)"),
                                 }
                                 match v.rotation_y {
                                     Some(y) => println!("  │    rotY         : {y}°"),
-                                    None    => println!("  │    rotY         : (default)"),
+                                    None => println!("  │    rotY         : (default)"),
                                 }
                                 match v.right_angle_axes {
-                                    Some(true)  => println!("  │    rAngAx       : true  (orthographic)"),
-                                    Some(false) => println!("  │    rAngAx       : false (perspective)"),
-                                    None        => println!("  │    rAngAx       : (default)"),
+                                    Some(true) => {
+                                        println!("  │    rAngAx       : true  (orthographic)")
+                                    }
+                                    Some(false) => {
+                                        println!("  │    rAngAx       : false (perspective)")
+                                    }
+                                    None => println!("  │    rAngAx       : (default)"),
                                 }
                                 match v.perspective {
                                     Some(p) => println!("  │    perspective  : {p}"),
-                                    None    => println!("  │    perspective  : (default)"),
+                                    None => println!("  │    perspective  : (default)"),
                                 }
                             }
                         }
 
                         // 3-D geometry surfaces (floor, side-wall, back-wall)
                         match &chart.surface {
-                            None => println!("  │  3D surf : (none — no <c:floor>/<c:sideWall>/<c:backWall>)"),
+                            None => println!(
+                                "  │  3D surf : (none — no <c:floor>/<c:sideWall>/<c:backWall>)"
+                            ),
                             Some(surf) => {
                                 println!("  │  3D surf :");
                                 println!(
@@ -150,18 +169,27 @@ fn main() {
                         println!(
                             "  │    [{:>2}] name_ref : {}",
                             s.index,
-                            s.name_ref.as_ref().map(|r| r.formula.as_str()).unwrap_or("—")
+                            s.name_ref
+                                .as_ref()
+                                .map(|r| r.formula.as_str())
+                                .unwrap_or("—")
                         );
                         if let Some(n) = &s.name {
                             println!("  │         name     : {n}");
                         }
                         println!(
                             "  │         cat_ref  : {}",
-                            s.category_ref.as_ref().map(|r| r.formula.as_str()).unwrap_or("—")
+                            s.category_ref
+                                .as_ref()
+                                .map(|r| r.formula.as_str())
+                                .unwrap_or("—")
                         );
                         println!(
                             "  │         val_ref  : {}",
-                            s.value_ref.as_ref().map(|r| r.formula.as_str()).unwrap_or("—")
+                            s.value_ref
+                                .as_ref()
+                                .map(|r| r.formula.as_str())
+                                .unwrap_or("—")
                         );
                         if let Some(cache) = &s.value_cache {
                             println!(
@@ -198,23 +226,21 @@ fn main() {
             }
 
             println!("\n{}", "─".repeat(70));
-            println!("Done (Phases 1–9).");
+            println!("Done (Phases 1–10).");
         }
     }
 }
 
 // ── Fill formatting helpers ───────────────────────────────────────────────────
 
-fn fmt_fill(
-    fill: Option<&Fill>,
-    theme: Option<&sheetforge_charts::model::theme::Theme>,
-) -> String {
+fn fmt_fill(fill: Option<&Fill>, theme: Option<&sheetforge_charts::model::theme::Theme>) -> String {
     match fill {
         None => "(none — no spPr)".into(),
         Some(Fill::None) => "noFill (explicit transparent; color from style/theme)".into(),
         Some(Fill::Pattern) => "pattern".into(),
         Some(Fill::Solid(spec)) => {
-            let resolved = spec.resolve(theme)
+            let resolved = spec
+                .resolve(theme)
                 .map(|rgb| format!(" → #{}", rgb.to_hex()))
                 .unwrap_or_else(|| " → (needs theme)".into());
             format!("solid  {}{}", fmt_color_spec(spec), resolved)

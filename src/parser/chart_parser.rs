@@ -152,6 +152,18 @@ struct ParseState {
     pending_side_wall_fill: Option<Fill>,
     /// Accumulated fill for `<c:backWall>`.
     pending_back_wall_fill: Option<Fill>,
+
+    // ── Pivot chart detection ─────────────────────────────────────────────────
+    /// Set to `true` while the parser is inside `<c:pivotSource>…</c:pivotSource>`.
+    /// Guards the `<c:name>` text handler so it only fires for pivot names,
+    /// not for series-title `<c:name>` elements elsewhere in the document.
+    in_pivot_source: bool,
+    /// Text accumulator for `<c:pivotSource><c:name>…</c:name>`.
+    /// Flushed to `pending_pivot_name` on `</c:name>`.
+    pivot_name_buf: String,
+    /// Completed pivot table name, set when `</c:name>` closes inside
+    /// `<c:pivotSource>`.  Transferred to `Chart.pivot_table_name` in `finish()`.
+    pending_pivot_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,6 +289,9 @@ impl ParseState {
             pending_floor_fill: None,
             pending_side_wall_fill: None,
             pending_back_wall_fill: None,
+            in_pivot_source: false,
+            pivot_name_buf: String::new(),
+            pending_pivot_name: None,
         }
     }
 
@@ -318,6 +333,16 @@ impl ParseState {
                 if let Some(v) = attr(e, b"val", dec)? {
                     self.style = v.parse().ok();
                 }
+            }
+
+            // ── Pivot chart detection ─────────────────────────────────────────
+            // <c:pivotSource> is a direct child of <c:chartSpace>, sibling of
+            // <c:chart>.  Its presence marks this as a pivot-backed chart.
+            // We only need the text of its <c:name> child; all other children
+            // (<c:fmtId>, etc.) are ignored.
+            "pivotSource" => {
+                self.in_pivot_source = true;
+                self.pivot_name_buf.clear();
             }
 
             // ── 3-D view ─────────────────────────────────────────────────────
@@ -652,6 +677,11 @@ impl ParseState {
             self.value_buf.push_str(text);
         } else if self.in_format_code {
             self.format_buf.push_str(text);
+        }
+        // Pivot source name — <c:pivotSource><c:name>text</c:name>.
+        // Must be checked before in_text_run because <c:name> has no <a:t> wrapper.
+        else if self.in_pivot_source {
+            self.pivot_name_buf.push_str(text);
         } else if self.in_text_run {
             if self.in_chart_title || self.in_axis_title {
                 if !self.title_buf.is_empty() {
@@ -672,6 +702,20 @@ impl ParseState {
             "view3D" => {
                 self.in_view_3d = false;
                 // view_3d is collected by finish(); nothing to flush here.
+            }
+
+            // ── Pivot chart detection ──────────────────────────────────────────
+            // </c:name> fires for many elements (series tx, axis titles, etc.).
+            // The `in_pivot_source` guard ensures we only capture the name that
+            // is a direct child of <c:pivotSource>.
+            "name" if self.in_pivot_source => {
+                let name = std::mem::take(&mut self.pivot_name_buf);
+                if !name.is_empty() {
+                    self.pending_pivot_name = Some(name);
+                }
+            }
+            "pivotSource" => {
+                self.in_pivot_source = false;
             }
 
             // ── 3-D surface elements ──────────────────────────────────────────
@@ -965,6 +1009,8 @@ impl ParseState {
             anchor: None, // set by sheet_parser after drawing anchor resolved
             view_3d,
             surface,
+            is_pivot_chart: self.pending_pivot_name.is_some(),
+            pivot_table_name: self.pending_pivot_name,
         }
     }
 }
@@ -2384,5 +2430,272 @@ mod tests {
     fn two_d_bar_chart_surface_is_none() {
         let c = parse_xml(BAR_XML, "c.xml").unwrap();
         assert!(c.surface.is_none());
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Phase 10 — Pivot chart detection tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── XML fixtures ─────────────────────────────────────────────────────────
+
+    /// Pivot bar chart with a fully-qualified pivot source name.
+    const PIVOT_BAR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:pivotSource>
+    <c:name>Sheet1!PivotTable1</c:name>
+    <c:fmtId val="0"/>
+  </c:pivotSource>
+  <c:chart>
+    <c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/>
+      <a:p><a:r><a:t>Pivot Chart</a:t></a:r></a:p>
+    </c:rich></c:tx><c:overlay val="0"/></c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f></c:strRef></c:tx>
+          <c:cat><c:strRef><c:f>Sheet1!$A$2:$A$4</c:f></c:strRef></c:cat>
+          <c:val><c:numRef><c:f>Sheet1!$B$2:$B$4</c:f>
+            <c:numCache>
+              <c:ptCount val="3"/>
+              <c:pt idx="0"><c:v>100</c:v></c:pt>
+              <c:pt idx="1"><c:v>200</c:v></c:pt>
+              <c:pt idx="2"><c:v>150</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:axId val="1"/><c:axId val="2"/>
+      </c:barChart>
+      <c:catAx><c:axId val="1"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>
+      <c:valAx><c:axId val="2"/><c:axPos val="l"/><c:crossAx val="1"/></c:valAx>
+    </c:plotArea>
+    <c:legend><c:legendPos val="b"/></c:legend>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// Pivot chart where the pivot table name has no sheet prefix.
+    const PIVOT_NO_SHEET_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:pivotSource>
+    <c:name>SalesData</c:name>
+    <c:fmtId val="1"/>
+  </c:pivotSource>
+  <c:chart>
+    <c:plotArea>
+      <c:pieChart>
+        <c:ser><c:idx val="0"/><c:order val="0"/></c:ser>
+      </c:pieChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// Pivot chart with a series that has an inline <c:name> text node —
+    /// confirms the series name does NOT pollute pivot_table_name.
+    const PIVOT_WITH_SERIES_NAME_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:pivotSource>
+    <c:name>Sheet2!PivotTable2</c:name>
+    <c:fmtId val="0"/>
+  </c:pivotSource>
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:strRef><c:f>Sheet2!$B$1</c:f>
+            <c:strCache>
+              <c:ptCount val="1"/>
+              <c:pt idx="0"><c:v>Revenue</c:v></c:pt>
+            </c:strCache>
+          </c:strRef></c:tx>
+          <c:val><c:numRef><c:f>Sheet2!$B$2:$B$3</c:f></c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// Non-pivot chart — no <c:pivotSource> at all.
+    const NON_PIVOT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:ser><c:idx val="0"/><c:order val="0"/></c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// <c:pivotSource> present but <c:name> child is empty — edge case.
+    const PIVOT_EMPTY_NAME_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:pivotSource>
+    <c:name></c:name>
+    <c:fmtId val="0"/>
+  </c:pivotSource>
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:ser><c:idx val="0"/><c:order val="0"/></c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    // ── is_pivot_chart ────────────────────────────────────────────────────────
+
+    #[test]
+    fn pivot_bar_is_pivot_chart() {
+        assert!(parse_xml(PIVOT_BAR_XML, "c.xml").unwrap().is_pivot_chart);
+    }
+
+    #[test]
+    fn pivot_no_sheet_is_pivot_chart() {
+        assert!(
+            parse_xml(PIVOT_NO_SHEET_XML, "c.xml")
+                .unwrap()
+                .is_pivot_chart
+        );
+    }
+
+    #[test]
+    fn pivot_with_series_name_is_pivot_chart() {
+        assert!(
+            parse_xml(PIVOT_WITH_SERIES_NAME_XML, "c.xml")
+                .unwrap()
+                .is_pivot_chart
+        );
+    }
+
+    #[test]
+    fn non_pivot_is_not_pivot_chart() {
+        assert!(!parse_xml(NON_PIVOT_XML, "c.xml").unwrap().is_pivot_chart);
+    }
+
+    #[test]
+    fn regular_bar_not_pivot() {
+        assert!(!parse_xml(BAR_XML, "c.xml").unwrap().is_pivot_chart);
+    }
+
+    #[test]
+    fn regular_line_not_pivot() {
+        assert!(!parse_xml(LINE_XML, "c.xml").unwrap().is_pivot_chart);
+    }
+
+    // ── pivot_table_name ──────────────────────────────────────────────────────
+
+    #[test]
+    fn pivot_bar_name_full() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        assert_eq!(c.pivot_table_name.as_deref(), Some("Sheet1!PivotTable1"));
+    }
+
+    #[test]
+    fn pivot_no_sheet_name_bare() {
+        let c = parse_xml(PIVOT_NO_SHEET_XML, "c.xml").unwrap();
+        assert_eq!(c.pivot_table_name.as_deref(), Some("SalesData"));
+    }
+
+    #[test]
+    fn pivot_with_series_name_correct() {
+        // pivot_table_name must be "Sheet2!PivotTable2", not "Revenue"
+        let c = parse_xml(PIVOT_WITH_SERIES_NAME_XML, "c.xml").unwrap();
+        assert_eq!(c.pivot_table_name.as_deref(), Some("Sheet2!PivotTable2"));
+    }
+
+    #[test]
+    fn non_pivot_name_is_none() {
+        let c = parse_xml(NON_PIVOT_XML, "c.xml").unwrap();
+        assert!(c.pivot_table_name.is_none());
+    }
+
+    #[test]
+    fn regular_bar_name_is_none() {
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        assert!(c.pivot_table_name.is_none());
+    }
+
+    // ── empty <c:name> edge case ──────────────────────────────────────────────
+
+    #[test]
+    fn pivot_empty_name_is_not_pivot() {
+        // Empty <c:name> → no name extracted → treated as non-pivot
+        let c = parse_xml(PIVOT_EMPTY_NAME_XML, "c.xml").unwrap();
+        assert!(
+            !c.is_pivot_chart,
+            "empty <c:name> should not mark chart as pivot"
+        );
+    }
+
+    #[test]
+    fn pivot_empty_name_name_is_none() {
+        let c = parse_xml(PIVOT_EMPTY_NAME_XML, "c.xml").unwrap();
+        assert!(c.pivot_table_name.is_none());
+    }
+
+    // ── isolation — series name does not leak into pivot_table_name ───────────
+
+    #[test]
+    fn series_name_does_not_pollute_pivot_name() {
+        let c = parse_xml(PIVOT_WITH_SERIES_NAME_XML, "c.xml").unwrap();
+        // The series cache has name "Revenue" — must not appear in pivot_table_name
+        let name = c.pivot_table_name.as_deref().unwrap_or("");
+        assert_ne!(
+            name, "Revenue",
+            "series name 'Revenue' must not bleed into pivot_table_name"
+        );
+    }
+
+    // ── other chart fields unaffected ─────────────────────────────────────────
+
+    #[test]
+    fn pivot_chart_type_still_bar() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::Bar);
+    }
+
+    #[test]
+    fn pivot_chart_title_still_parsed() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        assert_eq!(c.title.as_deref(), Some("Pivot Chart"));
+    }
+
+    #[test]
+    fn pivot_chart_legend_still_parsed() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        assert_eq!(c.legend_position, Some(LegendPosition::Bottom));
+    }
+
+    #[test]
+    fn pivot_chart_series_cache_intact() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        let cache = c.series[0]
+            .value_cache
+            .as_ref()
+            .expect("value cache should be present");
+        assert_eq!(cache.values, vec![100.0, 200.0, 150.0]);
+    }
+
+    #[test]
+    fn pivot_chart_surface_is_none() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        assert!(c.surface.is_none());
+    }
+
+    #[test]
+    fn pivot_chart_view3d_is_none() {
+        let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
+        assert!(c.view_3d.is_none());
     }
 }
