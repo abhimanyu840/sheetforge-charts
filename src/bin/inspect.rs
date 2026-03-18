@@ -1,4 +1,4 @@
-//! Manual inspection binary — shows the full Phase 1–10 output.
+//! Manual inspection binary — shows the full Phase 1–11 output.
 //!
 //! Usage:
 //!   cargo run --bin inspect -- tests/fixtures/test_charts.xlsx
@@ -74,12 +74,31 @@ fn main() {
                     println!("  │  legend  : {:?}", chart.legend_position);
                     println!("  │  grouping: {:?}", chart.plot_area.grouping);
 
-                    // Pivot chart detection (Phase 10)
+                    // Pivot chart detection (Phase 10) + metadata (Phase 11)
                     if chart.is_pivot_chart {
                         println!(
                             "  │  pivot   : YES  ({})",
                             chart.pivot_table_name.as_deref().unwrap_or("name unknown")
                         );
+                        match &chart.pivot_meta {
+                            None => println!("  │  pivot meta: (not resolved — no pivotTable rel)"),
+                            Some(m) => {
+                                println!("  │  pivot meta:");
+                                println!("  │    table name  : {}", m.pivot_table_name);
+                                println!(
+                                    "  │    source      : {}!{}",
+                                    m.source_sheet.as_deref().unwrap_or("(unknown sheet)"),
+                                    m.source_range.as_deref().unwrap_or("(no range)")
+                                );
+                                let field_names: Vec<&str> =
+                                    m.pivot_fields.iter().map(|f| f.name.as_str()).collect();
+                                println!(
+                                    "  │    fields [{}] : {}",
+                                    field_names.len(),
+                                    field_names.join(", ")
+                                );
+                            }
+                        }
                     } else {
                         println!("  │  pivot   : no");
                     }
@@ -226,7 +245,7 @@ fn main() {
             }
 
             println!("\n{}", "─".repeat(70));
-            println!("Done (Phases 1–10).");
+            println!("Done (Phases 1–11).");
         }
     }
 }

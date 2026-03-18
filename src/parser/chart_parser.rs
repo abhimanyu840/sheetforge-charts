@@ -1011,6 +1011,7 @@ impl ParseState {
             surface,
             is_pivot_chart: self.pending_pivot_name.is_some(),
             pivot_table_name: self.pending_pivot_name,
+            pivot_meta: None, // resolved in lib.rs Phase A5 after parse
         }
     }
 }

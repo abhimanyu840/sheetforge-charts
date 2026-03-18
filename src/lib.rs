@@ -52,7 +52,10 @@ use rayon::prelude::*;
 
 use crate::{
     archive::zip_reader::{open_xlsx, read_entry_bytes},
-    model::chart::{Chart, ChartAnchor},
+    model::{
+        chart::{Chart, ChartAnchor},
+        pivot::{PivotField, PivotTableMeta},
+    },
     openxml::relationships::{parse_for_part, rel_type, resolve_relative},
     parser::chart_parser,
 };
@@ -129,7 +132,8 @@ fn extract_charts_impl(path: &str) -> Result<WorkbookCharts> {
         jobs
     };
 
-    // Drop the archive — we no longer need the file handle.
+    // Drop the archive — we no longer need it for Phase B.
+    // It will be re-opened for Phase A5 (pivot metadata).
     drop(archive);
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -151,7 +155,7 @@ fn extract_charts_impl(path: &str) -> Result<WorkbookCharts> {
                 }
                 Err(e) => {
                     eprintln!("Warning: could not parse chart '{chart_path}': {e:#}");
-                    None  // keep the skeleton that was already in workbook.sheets
+                    None // keep the skeleton that was already in workbook.sheets
                 }
             }
         })
@@ -160,6 +164,39 @@ fn extract_charts_impl(path: &str) -> Result<WorkbookCharts> {
     // ── Reassemble: write parsed charts back into the workbook ────────────
     for (si, ci, chart) in parsed_charts {
         workbook.sheets[si].charts[ci] = chart;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PHASE A5 — Pivot metadata resolution (serial I/O)
+    //
+    // For each chart that was identified as a pivot chart in Phase B,
+    // walk the relationship chain:
+    //   chart.xml  →[pivotTable rel]→  pivotTableN.xml
+    //              →[pivotCacheDefinition rel]→  pivotCacheDefinitionN.xml
+    //
+    // This re-opens the archive (ZIP cursor is not Send, so it cannot be
+    // shared with Phase B's thread pool).
+    // ═══════════════════════════════════════════════════════════════════════
+    let mut archive = open_xlsx(path)?;
+
+    for sheet in workbook.sheets.iter_mut() {
+        for chart in sheet.charts.iter_mut() {
+            if !chart.is_pivot_chart {
+                continue;
+            }
+            match resolve_pivot_meta(&mut archive, &chart.chart_path) {
+                Ok(Some(meta)) => {
+                    chart.pivot_meta = Some(meta);
+                }
+                Ok(None) => { /* no pivotTable rel — leave pivot_meta as None */ }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not resolve pivot metadata for '{}': {e:#}",
+                        chart.chart_path
+                    );
+                }
+            }
+        }
     }
 
     Ok(workbook)
@@ -192,6 +229,74 @@ fn load_theme(
             None
         }
     }
+}
+
+// ── Pivot metadata helper ─────────────────────────────────────────────────────
+
+/// Follow the relationship chain from a chart part to its pivot table and cache
+/// definition, then assemble a [`PivotTableMeta`].
+///
+/// Returns:
+/// * `Ok(Some(meta))` — full metadata resolved successfully.
+/// * `Ok(None)` — chart has no `pivotTable` relationship (not a pivot chart
+///   in the relationship sense, even if `<pivotSource>` was present in XML).
+/// * `Err(_)` — I/O or parse error; caller should warn and continue.
+fn resolve_pivot_meta(
+    archive: &mut archive::zip_reader::XlsxArchive,
+    chart_path: &str,
+) -> Result<Option<PivotTableMeta>> {
+    // ── Step 1: chart.rels → pivotTable path ─────────────────────────────
+    let chart_rels = parse_for_part(archive, chart_path)?;
+    let pivot_table_path = match chart_rels
+        .by_type(rel_type::PIVOT_TABLE)
+        .map(|r| resolve_relative(chart_path, &r.target))
+        .next()
+    {
+        Some(p) => p,
+        None => return Ok(None), // no pivotTable relationship
+    };
+
+    // ── Step 2: parse pivotTableDefinition → name + field count ──────────
+    let pt_raw = parser::pivot_table_parser::parse(archive, &pivot_table_path)?;
+
+    // ── Step 3: pivotTable.rels → pivotCacheDefinition path ──────────────
+    let pt_rels = parse_for_part(archive, &pivot_table_path)?;
+    let cache_path = match pt_rels
+        .by_type(rel_type::PIVOT_CACHE_DEF)
+        .map(|r| resolve_relative(&pivot_table_path, &r.target))
+        .next()
+    {
+        Some(p) => p,
+        None => {
+            // Cache definition missing — return what we have without field names.
+            let meta = PivotTableMeta {
+                pivot_table_name: pt_raw.name,
+                pivot_fields: vec![],
+                source_sheet: None,
+                source_range: None,
+            };
+            return Ok(Some(meta));
+        }
+    };
+
+    // ── Step 4: parse pivotCacheDefinition → field names + source ────────
+    let cache_raw = parser::pivot_cache_parser::parse(archive, &cache_path)?;
+
+    // ── Step 5: assemble PivotTableMeta ──────────────────────────────────
+    // Join field names by position.  If the counts differ we take as many as
+    // we have names for (cache wins — it is authoritative on column identity).
+    let pivot_fields: Vec<PivotField> = cache_raw
+        .field_names
+        .into_iter()
+        .map(|name| PivotField { name })
+        .collect();
+
+    Ok(Some(PivotTableMeta {
+        pivot_table_name: pt_raw.name,
+        pivot_fields,
+        source_sheet: cache_raw.source_sheet,
+        source_range: cache_raw.source_range,
+    }))
 }
 
 #[cfg(feature = "python")]

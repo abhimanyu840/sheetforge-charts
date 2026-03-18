@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{axis::Axis, series::Series};
 use crate::model::color::Fill;
+use crate::model::pivot::PivotTableMeta;
 
 // ── ChartAnchor ───────────────────────────────────────────────────────────────
 
@@ -357,6 +358,16 @@ pub struct Chart {
     /// `"Sheet1!PivotTable1"`).  `None` when [`is_pivot_chart`](Chart::is_pivot_chart)
     /// is `false`.
     pub pivot_table_name: Option<String>,
+
+    /// Full pivot table metadata resolved by following the relationship chain
+    /// `chart → pivotTable → pivotCacheDefinition`.
+    ///
+    /// `None` when:
+    /// * [`is_pivot_chart`](Chart::is_pivot_chart) is `false`, or
+    /// * the chart `.rels` has no `pivotTable` relationship, or
+    /// * either the `pivotTableDefinition` or `pivotCacheDefinition` XML could
+    ///   not be parsed.
+    pub pivot_meta: Option<PivotTableMeta>,
 }
 
 impl Chart {
@@ -376,6 +387,7 @@ impl Chart {
             surface: None,
             is_pivot_chart: false,
             pivot_table_name: None,
+            pivot_meta: None,
         }
     }
 }
@@ -528,5 +540,10 @@ mod chart_type_tests {
     fn chart_pivot_name_none_by_default() {
         let c = Chart::new_skeleton("xl/charts/chart1.xml");
         assert!(c.pivot_table_name.is_none());
+    }
+    #[test]
+    fn chart_pivot_meta_none_by_default() {
+        let c = Chart::new_skeleton("xl/charts/chart1.xml");
+        assert!(c.pivot_meta.is_none());
     }
 }

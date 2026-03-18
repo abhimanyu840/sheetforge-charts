@@ -26,6 +26,14 @@ pub mod rel_type {
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
     pub const THEME: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+    /// Relationship from a chart part to its backing pivot table definition.
+    /// Present in `xl/charts/_rels/chartN.xml.rels` for pivot charts.
+    pub const PIVOT_TABLE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable";
+    /// Relationship from a pivot table definition to its cache definition.
+    /// Present in `xl/pivotTables/_rels/pivotTableN.xml.rels`.
+    pub const PIVOT_CACHE_DEF: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition";
 }
 
 // ── Core types ────────────────────────────────────────────────────────────────
@@ -218,7 +226,9 @@ pub(crate) fn resolve_relative(owner_part: &str, target: &str) -> String {
     for segment in target.split('/') {
         match segment {
             "" | "." => {}
-            ".." => { components.pop(); }
+            ".." => {
+                components.pop();
+            }
             s => components.push(s),
         }
     }
@@ -239,9 +249,9 @@ fn parse_relationship_element(
     for attr in e.attributes() {
         let attr = attr.context("Malformed attribute in .rels file")?;
         match attr.key.local_name().as_ref() {
-            b"Id"     => { id       = attr.decode_and_unescape_value(decoder)?.into_owned() }
-            b"Type"   => { rel_type = attr.decode_and_unescape_value(decoder)?.into_owned() }
-            b"Target" => { target   = attr.decode_and_unescape_value(decoder)?.into_owned() }
+            b"Id" => id = attr.decode_and_unescape_value(decoder)?.into_owned(),
+            b"Type" => rel_type = attr.decode_and_unescape_value(decoder)?.into_owned(),
+            b"Target" => target = attr.decode_and_unescape_value(decoder)?.into_owned(),
             _ => {}
         }
     }
@@ -250,7 +260,11 @@ fn parse_relationship_element(
         return Ok(None);
     }
 
-    Ok(Some(Relationship { id, rel_type, target }))
+    Ok(Some(Relationship {
+        id,
+        rel_type,
+        target,
+    }))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -291,7 +305,10 @@ mod tests {
 
     #[test]
     fn rels_path_workbook() {
-        assert_eq!(rels_path_for("xl/workbook.xml"), "xl/_rels/workbook.xml.rels");
+        assert_eq!(
+            rels_path_for("xl/workbook.xml"),
+            "xl/_rels/workbook.xml.rels"
+        );
     }
 
     #[test]
@@ -360,7 +377,10 @@ mod tests {
     fn resolve_target_workbook_to_sheet() {
         let rels = parse_xml(WORKBOOK_RELS_XML).unwrap();
         let rel = rels.by_id("rId1").unwrap();
-        assert_eq!(rels.resolve_target(rel, "xl/workbook.xml"), "xl/worksheets/sheet1.xml");
+        assert_eq!(
+            rels.resolve_target(rel, "xl/workbook.xml"),
+            "xl/worksheets/sheet1.xml"
+        );
     }
 
     #[test]
@@ -389,13 +409,13 @@ mod tests {
         let sh_rels = parse_xml(SHEET_RELS_XML).unwrap();
         let dr_rels = parse_xml(DRAWING_RELS_XML).unwrap();
 
-        let sheet_path   = wb_rels.resolve_id("rId1", "xl/workbook.xml").unwrap();
+        let sheet_path = wb_rels.resolve_id("rId1", "xl/workbook.xml").unwrap();
         let drawing_path = sh_rels.resolve_id("rId1", &sheet_path).unwrap();
-        let chart_path   = dr_rels.resolve_id("rId1", &drawing_path).unwrap();
+        let chart_path = dr_rels.resolve_id("rId1", &drawing_path).unwrap();
 
-        assert_eq!(sheet_path,   "xl/worksheets/sheet1.xml");
+        assert_eq!(sheet_path, "xl/worksheets/sheet1.xml");
         assert_eq!(drawing_path, "xl/drawings/drawing1.xml");
-        assert_eq!(chart_path,   "xl/charts/chart1.xml");
+        assert_eq!(chart_path, "xl/charts/chart1.xml");
     }
 
     #[test]
@@ -406,6 +426,9 @@ mod tests {
             .by_type(rel_type::CHART)
             .map(|r| dr_rels.resolve_target(r, owner))
             .collect();
-        assert_eq!(chart_paths, vec!["xl/charts/chart1.xml", "xl/charts/chart2.xml"]);
+        assert_eq!(
+            chart_paths,
+            vec!["xl/charts/chart1.xml", "xl/charts/chart2.xml"]
+        );
     }
 }

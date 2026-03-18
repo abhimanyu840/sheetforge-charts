@@ -1,31 +1,17 @@
-//! Integration tests — Phases 1–10.
+//! Integration tests — Phases 1–11.
 //!
 //! Fixtures:
 //!   tests/fixtures/test_charts.xlsx      (Phases 1–7, 2-D charts)
-//!     Sheet "Sales"    → chart1.xml  (bar,  2 series, theme fills)
-//!     Sheet "Expenses" → chart2.xml  (line, 1 series, no fill)
-//!     Sheet "Data"     → no chart
-//!     Theme: Office Theme (accent1 = #4472C4, accent2 = #ED7D31, …)
-//!     Anchors: both charts occupy rows 0–15, cols 0–8
-//!
 //!   tests/fixtures/test_3d_charts.xlsx   (Phase 8, 3-D charts)
-//!     Sheet "Bar3D"     → chart1.xml  bar3DChart     rotX=30  rotY=20  rAngAx=1 persp=30
-//!     Sheet "Line3D"    → chart2.xml  line3DChart    rotX=15  rotY=10  rAngAx=1 persp=0
-//!     Sheet "Area3D"    → chart3.xml  area3DChart    rotX=10  rotY=5   rAngAx=0 persp=45
-//!     Sheet "Pie3D"     → chart4.xml  pie3DChart     rotX=15  rotY=0   rAngAx=0 persp=45
-//!     Sheet "Surface3D" → chart5.xml  surface3DChart rotX=-30 rotY=180 (no rAngAx/persp)
-//!     Sheet "HBar3D"    → chart6.xml  bar3DChart(bar)rotX=20  rotY=15  rAngAx=1
-//!
 //!   tests/fixtures/test_surface_charts.xlsx  (Phase 9, surface geometry fills)
-//!     Sheet "AllSurfaces"    → chart1.xml  floor solid #D9D9D9, sideWall solid #4472C4,
-//!                                          backWall gradient #FF0000→#FFFFFF linear 90°
-//!     Sheet "FloorOnly"      → chart2.xml  floor solid #FF0000; sideWall+backWall absent
-//!     Sheet "NoFillSurfaces" → chart3.xml  all three surfaces carry explicit <a:noFill/>
-//!
-//!   tests/fixtures/test_pivot_charts.xlsx  (Phase 10, pivot chart detection)
+//!   tests/fixtures/test_pivot_charts.xlsx  (Phases 10–11, pivot detection + metadata)
 //!     Sheet "PivotChart"  → chart1.xml  bar chart + <pivotSource> "Sheet1!PivotTable1"
+//!                           chart1.xml.rels → pivotTable1.xml (PivotTable1, 4 fields)
+//!                           → pivotCacheDefinition1.xml (SourceData A1:D101)
 //!     Sheet "NoPivot"     → chart2.xml  bar chart, no <pivotSource>
 //!     Sheet "MultiPivot"  → chart3.xml  bar chart + <pivotSource> "Sales!RevenueByRegion"
+//!                           chart3.xml.rels → pivotTable2.xml (RevenueByRegion, 3 fields)
+//!                           → pivotCacheDefinition2.xml (SalesData B1:D51)
 
 use sheetforge_charts::{
     extract_charts,
@@ -33,6 +19,7 @@ use sheetforge_charts::{
         axis::{AxisPosition, AxisType},
         chart::{Chart3DSurface, Chart3DView, ChartAnchor, ChartType, Grouping, LegendPosition},
         color::{ColorSpec, Fill, GradientDirection, Rgb, ThemeColorSlot},
+        pivot::{PivotField, PivotTableMeta},
         series::CacheState,
     },
 };
@@ -598,7 +585,7 @@ fn non_zip_file_returns_error() {
 //   5   HBar3D      c:bar3DChart        bar      20    15     1     (none)
 // ═════════════════════════════════════════════════════════════════════════════
 
-// use sheetforge_charts::model::chart::Chart3DView;
+use sheetforge_charts::model::chart::Chart3DView;
 
 fn fixture_3d() -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1540,6 +1527,209 @@ fn surface_fixture_not_pivot() {
             assert!(
                 !chart.is_pivot_chart,
                 "surface fixture chart {} should not be pivot",
+                chart.chart_path
+            );
+        }
+    }
+}
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 11 — Pivot Table Metadata
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── pivot_meta presence ───────────────────────────────────────────────────────
+
+#[test]
+fn pivot_chart_has_meta() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].pivot_meta.is_some(),
+        "PivotChart sheet: pivot_meta should be Some"
+    );
+}
+
+#[test]
+fn no_pivot_chart_meta_is_none() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[1].charts[0].pivot_meta.is_none(),
+        "NoPivot sheet: pivot_meta should be None"
+    );
+}
+
+#[test]
+fn multi_pivot_chart_has_meta() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(
+        wb.sheets[2].charts[0].pivot_meta.is_some(),
+        "MultiPivot sheet: pivot_meta should be Some"
+    );
+}
+
+// ── pivot_table_name (from pivotTableDefinition, not from pivotSource) ────────
+
+#[test]
+fn pivot_meta_table_name_first_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.pivot_table_name, "PivotTable1");
+}
+
+#[test]
+fn pivot_meta_table_name_third_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.pivot_table_name, "RevenueByRegion");
+}
+
+// ── source_sheet ──────────────────────────────────────────────────────────────
+
+#[test]
+fn pivot_meta_source_sheet_first_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.source_sheet.as_deref(), Some("SourceData"));
+}
+
+#[test]
+fn pivot_meta_source_sheet_third_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.source_sheet.as_deref(), Some("SalesData"));
+}
+
+// ── source_range ──────────────────────────────────────────────────────────────
+
+#[test]
+fn pivot_meta_source_range_first_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.source_range.as_deref(), Some("A1:D101"));
+}
+
+#[test]
+fn pivot_meta_source_range_third_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.source_range.as_deref(), Some("B1:D51"));
+}
+
+// ── pivot_fields count ────────────────────────────────────────────────────────
+
+#[test]
+fn pivot_meta_field_count_first_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(
+        meta.pivot_fields.len(),
+        4,
+        "PivotTable1 should have 4 fields"
+    );
+}
+
+#[test]
+fn pivot_meta_field_count_third_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(
+        meta.pivot_fields.len(),
+        3,
+        "RevenueByRegion should have 3 fields"
+    );
+}
+
+// ── pivot_fields names in order ───────────────────────────────────────────────
+
+#[test]
+fn pivot_meta_fields_first_chart_in_order() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    let names: Vec<&str> = meta.pivot_fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["Region", "Product", "Category", "Sales"]);
+}
+
+#[test]
+fn pivot_meta_fields_third_chart_in_order() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    let names: Vec<&str> = meta.pivot_fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["Region", "Quarter", "Revenue"]);
+}
+
+#[test]
+fn pivot_meta_first_field_name_first_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.pivot_fields[0].name, "Region");
+}
+
+#[test]
+fn pivot_meta_last_field_name_first_chart() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.pivot_fields[3].name, "Sales");
+}
+
+// ── other chart fields still correct alongside pivot_meta ─────────────────────
+
+#[test]
+fn pivot_meta_chart_type_still_bar() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn pivot_meta_is_pivot_chart_still_true() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(wb.sheets[0].charts[0].is_pivot_chart);
+}
+
+#[test]
+fn pivot_meta_pivot_table_name_field_matches_source_name() {
+    // pivot_table_name (from <pivotSource>) is "Sheet1!PivotTable1"
+    // pivot_meta.pivot_table_name (from pivotTableDefinition) is "PivotTable1"
+    // These are two different representations — both should be present.
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    assert_eq!(
+        chart.pivot_table_name.as_deref(),
+        Some("Sheet1!PivotTable1")
+    );
+    assert_eq!(
+        chart.pivot_meta.as_ref().unwrap().pivot_table_name,
+        "PivotTable1"
+    );
+}
+
+// ── regression: non-pivot fixture charts have no pivot_meta ──────────────────
+
+#[test]
+fn sales_chart_pivot_meta_is_none() {
+    let wb = extract_charts(&fixture()).unwrap();
+    assert!(wb.sheets[0].charts[0].pivot_meta.is_none());
+}
+
+#[test]
+fn bar3d_charts_pivot_meta_is_none() {
+    let wb = extract_charts(&fixture_3d()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert!(
+                chart.pivot_meta.is_none(),
+                "3-D chart {} should have no pivot_meta",
+                chart.chart_path
+            );
+        }
+    }
+}
+
+#[test]
+fn surface_charts_pivot_meta_is_none() {
+    let wb = extract_charts(&fixture_surface()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert!(
+                chart.pivot_meta.is_none(),
+                "surface chart {} should have no pivot_meta",
                 chart.chart_path
             );
         }
