@@ -34,6 +34,10 @@ pub mod rel_type {
     /// Present in `xl/pivotTables/_rels/pivotTableN.xml.rels`.
     pub const PIVOT_CACHE_DEF: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition";
+    /// Relationship from a pivot cache definition to its cache records.
+    /// Present in `xl/pivotCache/_rels/pivotCacheDefinitionN.xml.rels`.
+    pub const PIVOT_CACHE_RECORDS: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords";
 }
 
 // ── Core types ────────────────────────────────────────────────────────────────

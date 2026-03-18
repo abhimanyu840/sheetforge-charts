@@ -274,6 +274,7 @@ fn resolve_pivot_meta(
                 pivot_fields: vec![],
                 source_sheet: None,
                 source_range: None,
+                pivot_series: vec![],
             };
             return Ok(Some(meta));
         }
@@ -282,9 +283,33 @@ fn resolve_pivot_meta(
     // ── Step 4: parse pivotCacheDefinition → field names + source ────────
     let cache_raw = parser::pivot_cache_parser::parse(archive, &cache_path)?;
 
-    // ── Step 5: assemble PivotTableMeta ──────────────────────────────────
-    // Join field names by position.  If the counts differ we take as many as
-    // we have names for (cache wins — it is authoritative on column identity).
+    // ── Step 5: pivotCacheDefinition.rels → pivotCacheRecords path ────────
+    let cache_rels = parse_for_part(archive, &cache_path)?;
+    let records_path = cache_rels
+        .by_type(rel_type::PIVOT_CACHE_RECORDS)
+        .map(|r| resolve_relative(&cache_path, &r.target))
+        .next();
+
+    // ── Step 6: parse records and aggregate into Series ───────────────────
+    let pivot_series = match records_path {
+        Some(ref rpath) => {
+            match parser::pivot_records_parser::parse_and_aggregate(
+                archive, rpath, &cache_raw, &pt_raw,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not aggregate pivot records '{}': {e:#}",
+                        rpath
+                    );
+                    vec![]
+                }
+            }
+        }
+        None => vec![], // no records file — leave series empty
+    };
+
+    // ── Step 7: assemble PivotTableMeta ──────────────────────────────────
     let pivot_fields: Vec<PivotField> = cache_raw
         .field_names
         .into_iter()
@@ -296,6 +321,7 @@ fn resolve_pivot_meta(
         pivot_fields,
         source_sheet: cache_raw.source_sheet,
         source_range: cache_raw.source_range,
+        pivot_series,
     }))
 }
 

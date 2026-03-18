@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::series::Series;
+
 // ── PivotField ────────────────────────────────────────────────────────────────
 
 /// A single field (column) in a pivot table, from `<pivotField>` inside
@@ -41,7 +43,7 @@ pub struct PivotField {
 /// [`crate::model::chart::Chart::is_pivot_chart`] is `true` **and** the
 /// relationship chain can be fully resolved.  May be `None` even for pivot
 /// charts if the pivot table or cache parts are missing or malformed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PivotTableMeta {
     /// Canonical name from `<pivotTableDefinition name="…"/>`.
     ///
@@ -71,6 +73,21 @@ pub struct PivotTableMeta {
     /// Written as a standard A1-notation range string (e.g. `"A1:D100"`).
     /// `None` when absent (some sources use a named table instead of a range).
     pub source_range: Option<String>,
+
+    /// Aggregated series built from `pivotCacheRecordsN.xml`.
+    ///
+    /// Each [`Series`] corresponds to one combination of column-field value and
+    /// data-field:
+    /// * `series.name` — column-field value (e.g. `"Widget"`) or data-field
+    ///   display name when there are no column fields.
+    /// * `series.category_values` — ordered unique row-field values (the
+    ///   category axis labels).
+    /// * `series.value_cache` — aggregated values aligned to category order.
+    /// * `series.value_cache_state = CacheState::Complete`.
+    ///
+    /// Empty when the cache-records file is absent, unreadable, or when the
+    /// pivot table has no data fields configured.
+    pub pivot_series: Vec<Series>,
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -90,6 +107,7 @@ mod tests {
                 .collect(),
             source_sheet: Some("Sheet1".to_owned()),
             source_range: Some("A1:D10".to_owned()),
+            pivot_series: vec![],
         }
     }
 
@@ -134,6 +152,7 @@ mod tests {
             pivot_fields: vec![],
             source_sheet: None,
             source_range: None,
+            pivot_series: vec![],
         };
         assert!(m.source_sheet.is_none());
         assert!(m.source_range.is_none());

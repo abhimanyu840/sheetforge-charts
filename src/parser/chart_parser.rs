@@ -17,7 +17,7 @@ use crate::{
     archive::zip_reader::{read_entry_bytes, XlsxArchive},
     model::{
         axis::{Axis, AxisPosition, AxisType},
-        chart::{Chart, Chart3DSurface, ChartType, Grouping, LegendPosition, PlotArea},
+        chart::{Chart, Chart3DSurface, ChartLayer, ChartType, Grouping, LegendPosition, PlotArea},
         color::{
             ColorMod, ColorSpec, Fill, Gradient, GradientDirection, GradientStop, Rgb,
             ThemeColorSlot,
@@ -164,6 +164,20 @@ struct ParseState {
     /// Completed pivot table name, set when `</c:name>` closes inside
     /// `<c:pivotSource>`.  Transferred to `Chart.pivot_table_name` in `finish()`.
     pending_pivot_name: Option<String>,
+
+    // ── Combo / layer tracking ────────────────────────────────────────────────
+    /// Completed [`ChartLayer`] values, one per chart-type element in the plot
+    /// area.  Built up in `on_end` when each chart tag closes.
+    pending_layers: Vec<ChartLayer>,
+    /// Series accumulated for the *current* chart-type element.
+    /// Drained into a new [`ChartLayer`] when the chart element closes.
+    current_layer_series: Vec<Series>,
+    /// Chart type of the layer currently being parsed.
+    current_layer_type: ChartType,
+    /// Grouping for the layer currently being parsed.
+    current_layer_grouping: Option<Grouping>,
+    /// Whether the current layer is a horizontal-bar layer.
+    current_layer_bar_horiz: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -292,6 +306,11 @@ impl ParseState {
             in_pivot_source: false,
             pivot_name_buf: String::new(),
             pending_pivot_name: None,
+            pending_layers: Vec::new(),
+            current_layer_series: Vec::new(),
+            current_layer_type: ChartType::Unknown,
+            current_layer_grouping: None,
+            current_layer_bar_horiz: false,
         }
     }
 
@@ -378,18 +397,32 @@ impl ParseState {
 
             t if ChartType::is_chart_tag(t) && self.in_plot_area => {
                 if self.chart_tag_depth == 0 {
-                    self.plot_area.chart_type = ChartType::from_xml_tag(t);
+                    // Starting a new chart-type layer.  Record the primary type
+                    // on plot_area for backwards compat (first layer wins).
+                    let ct = ChartType::from_xml_tag(t);
+                    if matches!(self.plot_area.chart_type, ChartType::Unknown) {
+                        self.plot_area.chart_type = ct.clone();
+                    }
+                    // Reset per-layer accumulators for this new layer.
+                    self.current_layer_type = ct;
+                    self.current_layer_grouping = None;
+                    self.current_layer_bar_horiz = false;
+                    self.current_layer_series = Vec::new();
                 }
                 self.chart_tag_depth += 1;
             }
             "barDir" => {
                 if let Some(v) = attr(e, b"val", dec)? {
-                    self.plot_area.bar_horizontal = v == "bar";
+                    let horiz = v == "bar";
+                    self.plot_area.bar_horizontal = horiz;
+                    self.current_layer_bar_horiz = horiz;
                 }
             }
             "grouping" => {
                 if let Some(v) = attr(e, b"val", dec)? {
-                    self.plot_area.grouping = Grouping::from_val(&v);
+                    let g = Grouping::from_val(&v);
+                    self.plot_area.grouping = g.clone();
+                    self.current_layer_grouping = g;
                 }
             }
 
@@ -737,6 +770,23 @@ impl ParseState {
 
             t if ChartType::is_chart_tag(t) && self.chart_tag_depth > 0 => {
                 self.chart_tag_depth -= 1;
+                if self.chart_tag_depth == 0 {
+                    // Resolve horizontal-bar variant for this layer.
+                    let layer_type = match (&self.current_layer_type, self.current_layer_bar_horiz)
+                    {
+                        (ChartType::Bar, true) => ChartType::HorizontalBar,
+                        (ChartType::Bar3D, true) => ChartType::HorizontalBar3D,
+                        _ => self.current_layer_type.clone(),
+                    };
+                    self.pending_layers.push(ChartLayer {
+                        chart_type: layer_type,
+                        series: std::mem::take(&mut self.current_layer_series),
+                        grouping: self.current_layer_grouping.take(),
+                        bar_horizontal: self.current_layer_bar_horiz,
+                    });
+                    self.current_layer_type = ChartType::Unknown;
+                    self.current_layer_bar_horiz = false;
+                }
             }
 
             "ser" => {
@@ -746,6 +796,9 @@ impl ParseState {
                 if self.ser_depth == 0 {
                     self.in_ser = false;
                     if let Some(s) = self.current_series.take() {
+                        // Push into both the flat plot_area list (backwards compat)
+                        // and the current-layer accumulator.
+                        self.current_layer_series.push(s.clone());
                         self.plot_area.series.push(s);
                     }
                 }
@@ -963,14 +1016,41 @@ impl ParseState {
     fn finish(self) -> Chart {
         let series = self.plot_area.series.clone();
         let axes = self.plot_area.axes.clone();
-        let chart_type = self.plot_area.chart_type.clone();
 
-        // Resolve horizontal-bar variants (both 2-D and 3-D).
-        let chart_type = match (&chart_type, self.plot_area.bar_horizontal) {
-            (ChartType::Bar, true) => ChartType::HorizontalBar,
-            (ChartType::Bar3D, true) => ChartType::HorizontalBar3D,
-            _ => chart_type,
+        // ── Determine primary chart type and finalise layers ──────────────────
+        // Each layer's horizontal-bar variant was already resolved in on_end.
+        // The primary type is:
+        //   - The single layer's type for simple charts.
+        //   - ChartType::Combo when layers have distinct types.
+        //   - Falls back to plot_area.chart_type (first seen) for empty layers.
+        let layers = self.pending_layers;
+
+        let chart_type = if layers.len() > 1 {
+            // Check whether all layers share the same type.
+            let first = &layers[0].chart_type;
+            let all_same = layers.iter().all(|l| &l.chart_type == first);
+            if all_same {
+                first.clone()
+            } else {
+                ChartType::Combo
+            }
+        } else if let Some(layer) = layers.first() {
+            layer.chart_type.clone()
+        } else {
+            // No layers parsed — fall back to the plot_area type (handles the
+            // old bar_horizontal upgrade for any legacy code path).
+            match (
+                self.plot_area.chart_type.clone(),
+                self.plot_area.bar_horizontal,
+            ) {
+                (ChartType::Bar, true) => ChartType::HorizontalBar,
+                (ChartType::Bar3D, true) => ChartType::HorizontalBar3D,
+                (t, _) => t,
+            }
         };
+
+        // Keep plot_area.chart_type consistent with the resolved primary type.
+        let plot_area_chart_type = chart_type.clone();
 
         // Only attach view_3d when it actually carried data.
         let view_3d = if self.pending_view_3d.is_empty() {
@@ -995,12 +1075,12 @@ impl ParseState {
 
         Chart {
             chart_path: self.chart_path,
-            chart_type: chart_type.clone(),
+            chart_type,
             title: self.title_text,
             legend_position: self.legend_position,
             style: self.style,
             plot_area: PlotArea {
-                chart_type,
+                chart_type: plot_area_chart_type,
                 ..self.plot_area
             },
             series,
@@ -1012,6 +1092,7 @@ impl ParseState {
             is_pivot_chart: self.pending_pivot_name.is_some(),
             pivot_table_name: self.pending_pivot_name,
             pivot_meta: None, // resolved in lib.rs Phase A5 after parse
+            layers,
         }
     }
 }
@@ -2698,5 +2779,395 @@ mod tests {
     fn pivot_chart_view3d_is_none() {
         let c = parse_xml(PIVOT_BAR_XML, "c.xml").unwrap();
         assert!(c.view_3d.is_none());
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Phase 13 — Combo Chart (ChartLayer) unit tests
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // ── XML fixtures ─────────────────────────────────────────────────────────
+
+    /// Bar + Line combo: 2 bar series, 1 line series.
+    const BAR_LINE_COMBO_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/>
+      <a:p><a:r><a:t>Combo Chart</a:t></a:r></a:p>
+    </c:rich></c:tx><c:overlay val="0"/></c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f></c:strRef></c:tx>
+          <c:val><c:numRef><c:f>Sheet1!$B$2:$B$5</c:f>
+            <c:numCache>
+              <c:ptCount val="4"/>
+              <c:pt idx="0"><c:v>10</c:v></c:pt>
+              <c:pt idx="1"><c:v>20</c:v></c:pt>
+              <c:pt idx="2"><c:v>30</c:v></c:pt>
+              <c:pt idx="3"><c:v>40</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:ser>
+          <c:idx val="1"/><c:order val="1"/>
+          <c:tx><c:strRef><c:f>Sheet1!$C$1</c:f></c:strRef></c:tx>
+          <c:val><c:numRef><c:f>Sheet1!$C$2:$C$5</c:f>
+            <c:numCache>
+              <c:ptCount val="4"/>
+              <c:pt idx="0"><c:v>5</c:v></c:pt>
+              <c:pt idx="1"><c:v>15</c:v></c:pt>
+              <c:pt idx="2"><c:v>25</c:v></c:pt>
+              <c:pt idx="3"><c:v>35</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:axId val="1"/><c:axId val="2"/>
+      </c:barChart>
+      <c:lineChart>
+        <c:grouping val="standard"/>
+        <c:ser>
+          <c:idx val="2"/><c:order val="2"/>
+          <c:tx><c:strRef><c:f>Sheet1!$D$1</c:f></c:strRef></c:tx>
+          <c:val><c:numRef><c:f>Sheet1!$D$2:$D$5</c:f>
+            <c:numCache>
+              <c:ptCount val="4"/>
+              <c:pt idx="0"><c:v>100</c:v></c:pt>
+              <c:pt idx="1"><c:v>200</c:v></c:pt>
+              <c:pt idx="2"><c:v>300</c:v></c:pt>
+              <c:pt idx="3"><c:v>400</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+        <c:axId val="1"/><c:axId val="3"/>
+      </c:lineChart>
+      <c:catAx><c:axId val="1"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>
+      <c:valAx><c:axId val="2"/><c:axPos val="l"/><c:crossAx val="1"/></c:valAx>
+      <c:valAx><c:axId val="3"/><c:axPos val="r"/><c:crossAx val="1"/></c:valAx>
+    </c:plotArea>
+    <c:legend><c:legendPos val="b"/></c:legend>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// Two bar charts with the same type — should NOT produce Combo.
+    const DUAL_BAR_SAME_TYPE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/><c:grouping val="clustered"/>
+        <c:ser><c:idx val="0"/><c:order val="0"/>
+          <c:val><c:numRef><c:f>Sheet1!$B$2:$B$5</c:f>
+            <c:numCache><c:ptCount val="2"/>
+              <c:pt idx="0"><c:v>1</c:v></c:pt>
+              <c:pt idx="1"><c:v>2</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+      <c:barChart>
+        <c:barDir val="col"/><c:grouping val="stacked"/>
+        <c:ser><c:idx val="1"/><c:order val="1"/>
+          <c:val><c:numRef><c:f>Sheet1!$C$2:$C$5</c:f>
+            <c:numCache><c:ptCount val="2"/>
+              <c:pt idx="0"><c:v>3</c:v></c:pt>
+              <c:pt idx="1"><c:v>4</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    /// Three-layer combo: Bar + Line + Area.
+    const THREE_LAYER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/><c:grouping val="clustered"/>
+        <c:ser><c:idx val="0"/><c:order val="0"/>
+          <c:val><c:numRef><c:f>S!$A$1</c:f>
+            <c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+      <c:lineChart>
+        <c:grouping val="standard"/>
+        <c:ser><c:idx val="1"/><c:order val="1"/>
+          <c:val><c:numRef><c:f>S!$B$1</c:f>
+            <c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+      </c:lineChart>
+      <c:areaChart>
+        <c:grouping val="standard"/>
+        <c:ser><c:idx val="2"/><c:order val="2"/>
+          <c:val><c:numRef><c:f>S!$C$1</c:f>
+            <c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>3</c:v></c:pt></c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+      </c:areaChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    // ── chart_type == Combo ───────────────────────────────────────────────────
+
+    #[test]
+    fn bar_line_combo_chart_type_is_combo() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::Combo);
+    }
+
+    #[test]
+    fn three_layer_combo_chart_type_is_combo() {
+        let c = parse_xml(THREE_LAYER_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::Combo);
+    }
+
+    #[test]
+    fn dual_same_type_not_combo() {
+        // Two barCharts with same type → first type wins, not Combo
+        let c = parse_xml(DUAL_BAR_SAME_TYPE_XML, "c.xml").unwrap();
+        assert_eq!(
+            c.chart_type,
+            ChartType::Bar,
+            "two layers of the same type should NOT produce Combo"
+        );
+    }
+
+    #[test]
+    fn single_bar_not_combo() {
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        assert_ne!(c.chart_type, ChartType::Combo);
+    }
+
+    // ── layers count ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn bar_line_combo_has_two_layers() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers.len(), 2);
+    }
+
+    #[test]
+    fn three_layer_has_three_layers() {
+        let c = parse_xml(THREE_LAYER_XML, "c.xml").unwrap();
+        assert_eq!(c.layers.len(), 3);
+    }
+
+    #[test]
+    fn single_bar_has_one_layer() {
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        assert_eq!(c.layers.len(), 1);
+    }
+
+    #[test]
+    fn single_line_has_one_layer() {
+        let c = parse_xml(LINE_XML, "c.xml").unwrap();
+        assert_eq!(c.layers.len(), 1);
+    }
+
+    // ── layer types ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn combo_layer0_type_is_bar() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[0].chart_type, ChartType::Bar);
+    }
+
+    #[test]
+    fn combo_layer1_type_is_line() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[1].chart_type, ChartType::Line);
+    }
+
+    #[test]
+    fn three_layer_types_in_order() {
+        let c = parse_xml(THREE_LAYER_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[0].chart_type, ChartType::Bar);
+        assert_eq!(c.layers[1].chart_type, ChartType::Line);
+        assert_eq!(c.layers[2].chart_type, ChartType::Area);
+    }
+
+    // ── layer series counts ───────────────────────────────────────────────────
+
+    #[test]
+    fn combo_layer0_has_two_bar_series() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(
+            c.layers[0].series.len(),
+            2,
+            "bar layer must hold exactly its 2 series"
+        );
+    }
+
+    #[test]
+    fn combo_layer1_has_one_line_series() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(
+            c.layers[1].series.len(),
+            1,
+            "line layer must hold exactly its 1 series"
+        );
+    }
+
+    #[test]
+    fn combo_flat_series_has_all_three() {
+        // chart.series is the flat convenience mirror — all layers combined
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(
+            c.series.len(),
+            3,
+            "flat series must contain all series across all layers"
+        );
+    }
+
+    #[test]
+    fn plot_area_series_has_all_three() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.plot_area.series.len(), 3);
+    }
+
+    // ── layer series indices are correct ─────────────────────────────────────
+
+    #[test]
+    fn combo_bar_layer_series_indices() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[0].series[0].index, 0);
+        assert_eq!(c.layers[0].series[1].index, 1);
+    }
+
+    #[test]
+    fn combo_line_layer_series_index() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[1].series[0].index, 2);
+    }
+
+    // ── layer series caches ───────────────────────────────────────────────────
+
+    #[test]
+    fn combo_bar_layer_series0_cache() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        let vals = c.layers[0].series[0].value_cache.as_ref().unwrap();
+        assert_eq!(vals.values, vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn combo_bar_layer_series1_cache() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        let vals = c.layers[0].series[1].value_cache.as_ref().unwrap();
+        assert_eq!(vals.values, vec![5.0, 15.0, 25.0, 35.0]);
+    }
+
+    #[test]
+    fn combo_line_layer_series_cache() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        let vals = c.layers[1].series[0].value_cache.as_ref().unwrap();
+        assert_eq!(vals.values, vec![100.0, 200.0, 300.0, 400.0]);
+    }
+
+    // ── layer grouping ────────────────────────────────────────────────────────
+
+    #[test]
+    fn combo_bar_layer_grouping_clustered() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[0].grouping, Some(Grouping::Clustered));
+    }
+
+    #[test]
+    fn combo_line_layer_grouping_standard() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.layers[1].grouping, Some(Grouping::Standard));
+    }
+
+    /// 2-D horizontal bar chart (barDir val="bar").
+    const HBAR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="bar"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:val><c:numRef><c:f>Sheet1!$B$2:$B$4</c:f>
+            <c:numCache>
+              <c:ptCount val="3"/>
+              <c:pt idx="0"><c:v>1</c:v></c:pt>
+              <c:pt idx="1"><c:v>2</c:v></c:pt>
+              <c:pt idx="2"><c:v>3</c:v></c:pt>
+            </c:numCache>
+          </c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    // ── horizontal bar isolation ──────────────────────────────────────────────
+
+    #[test]
+    fn hbar_layer_bar_horizontal_true() {
+        let c = parse_xml(HBAR3D_XML, "c.xml").unwrap();
+        assert!(c.layers[0].bar_horizontal);
+    }
+
+    #[test]
+    fn bar_layer_bar_horizontal_false() {
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        assert!(!c.layers[0].bar_horizontal);
+    }
+
+    // ── title and legend not affected ─────────────────────────────────────────
+
+    #[test]
+    fn combo_title_still_parsed() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.title.as_deref(), Some("Combo Chart"));
+    }
+
+    #[test]
+    fn combo_legend_still_parsed() {
+        let c = parse_xml(BAR_LINE_COMBO_XML, "c.xml").unwrap();
+        assert_eq!(c.legend_position, Some(LegendPosition::Bottom));
+    }
+
+    // ── regression: existing single-type charts unaffected ───────────────────
+
+    #[test]
+    fn existing_bar_chart_type_preserved() {
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::Bar);
+    }
+
+    #[test]
+    fn existing_line_chart_type_preserved() {
+        let c = parse_xml(LINE_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::Line);
+    }
+
+    #[test]
+    fn existing_hbar_chart_type_preserved() {
+        let c = parse_xml(HBAR_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::HorizontalBar);
+    }
+
+    #[test]
+    fn existing_bar3d_chart_type_preserved() {
+        let c = parse_xml(BAR3D_XML, "c.xml").unwrap();
+        assert_eq!(c.chart_type, ChartType::Bar3D);
+    }
+
+    #[test]
+    fn single_layer_chart_series_still_in_flat_list() {
+        let c = parse_xml(BAR_XML, "c.xml").unwrap();
+        assert!(!c.series.is_empty());
+        assert_eq!(c.series.len(), c.layers[0].series.len());
     }
 }

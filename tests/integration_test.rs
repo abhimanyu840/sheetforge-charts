@@ -585,8 +585,6 @@ fn non_zip_file_returns_error() {
 //   5   HBar3D      c:bar3DChart        bar      20    15     1     (none)
 // ═════════════════════════════════════════════════════════════════════════════
 
-use sheetforge_charts::model::chart::Chart3DView;
-
 fn fixture_3d() -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/test_3d_charts.xlsx")
@@ -1730,6 +1728,464 @@ fn surface_charts_pivot_meta_is_none() {
             assert!(
                 chart.pivot_meta.is_none(),
                 "surface chart {} should have no pivot_meta",
+                chart.chart_path
+            );
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 12 — Pivot Chart Data Extraction (cached records aggregation)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Fixture: test_pivot_charts.xlsx
+//
+// Pivot 1 (PivotTable1) — single series, no col field:
+//   Fields: Region(row=0), Product(idx=1), Category(idx=2), Sales(data=3)
+//   sharedItems: Region=[North,South,East], Product=[Widget,Gadget], Category=[Electronics,Hardware]
+//   Records (6 rows) → Sum of Sales by Region:
+//     North = 1500+2300 = 3800
+//     South = 800+1200  = 2000
+//     East  = 3100+900  = 4000
+//
+// Pivot 2 (RevenueByRegion) — multi-series, col field=Quarter:
+//   Fields: Region(row=0), Quarter(col=1), Revenue(data=2)
+//   sharedItems: Region=[East,West], Quarter=[Q1,Q2]
+//   Records (4 rows) → Sum of Revenue:
+//     Q1: East=5000, West=3000
+//     Q2: East=6000, West=4500
+
+// ── pivot_series presence ─────────────────────────────────────────────────────
+
+#[test]
+fn pivot1_has_cached_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert!(
+        !meta.pivot_series.is_empty(),
+        "PivotTable1 should have cached series from records"
+    );
+}
+
+#[test]
+fn pivot2_has_cached_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    assert!(
+        !meta.pivot_series.is_empty(),
+        "RevenueByRegion should have cached series from records"
+    );
+}
+
+#[test]
+fn no_pivot_chart_has_no_cached_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    // NoPivot sheet has no pivot_meta at all
+    assert!(wb.sheets[1].charts[0].pivot_meta.is_none());
+}
+
+// ── Pivot 1: single-series aggregation ───────────────────────────────────────
+
+#[test]
+fn pivot1_single_series_count() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(
+        meta.pivot_series.len(),
+        1,
+        "PivotTable1 has one data field and no col field → 1 series"
+    );
+}
+
+#[test]
+fn pivot1_series_name_is_data_field_name() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(meta.pivot_series[0].name.as_deref(), Some("Sum of Sales"));
+}
+
+#[test]
+fn pivot1_categories_in_order() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    let cats = meta.pivot_series[0]
+        .category_values
+        .as_ref()
+        .unwrap()
+        .values
+        .as_slice();
+    assert_eq!(cats, &["North", "South", "East"]);
+}
+
+#[test]
+fn pivot1_values_summed_correctly() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    let vals = &meta.pivot_series[0].value_cache.as_ref().unwrap().values;
+    // North=1500+2300=3800, South=800+1200=2000, East=3100+900=4000
+    assert_eq!(vals, &[3800.0, 2000.0, 4000.0]);
+}
+
+#[test]
+fn pivot1_value_cache_state_complete() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    use sheetforge_charts::model::series::CacheState;
+    assert_eq!(meta.pivot_series[0].value_cache_state, CacheState::Complete);
+}
+
+#[test]
+fn pivot1_category_cache_state_complete() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    use sheetforge_charts::model::series::CacheState;
+    assert_eq!(
+        meta.pivot_series[0].category_cache_state,
+        CacheState::Complete
+    );
+}
+
+#[test]
+fn pivot1_category_count_matches_value_count() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[0].charts[0].pivot_meta.as_ref().unwrap();
+    let s = &meta.pivot_series[0];
+    let n_cats = s.category_values.as_ref().unwrap().values.len();
+    let n_vals = s.value_cache.as_ref().unwrap().values.len();
+    assert_eq!(n_cats, n_vals);
+}
+
+// ── Pivot 2: multi-series (col field) aggregation ────────────────────────────
+
+#[test]
+fn pivot2_two_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    assert_eq!(
+        meta.pivot_series.len(),
+        2,
+        "RevenueByRegion has 1 data field × 2 col values = 2 series"
+    );
+}
+
+#[test]
+fn pivot2_series_names_include_quarter() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    let names: Vec<&str> = meta
+        .pivot_series
+        .iter()
+        .map(|s| s.name.as_deref().unwrap_or(""))
+        .collect();
+    // Series names include the data field name and the col key
+    assert!(
+        names[0].contains("Q1"),
+        "first series should reference Q1, got {:?}",
+        names[0]
+    );
+    assert!(
+        names[1].contains("Q2"),
+        "second series should reference Q2, got {:?}",
+        names[1]
+    );
+}
+
+#[test]
+fn pivot2_categories_are_regions() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    let cats = meta.pivot_series[0]
+        .category_values
+        .as_ref()
+        .unwrap()
+        .values
+        .as_slice();
+    assert_eq!(cats, &["East", "West"]);
+}
+
+#[test]
+fn pivot2_categories_same_across_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    let cats0 = &meta.pivot_series[0]
+        .category_values
+        .as_ref()
+        .unwrap()
+        .values;
+    let cats1 = &meta.pivot_series[1]
+        .category_values
+        .as_ref()
+        .unwrap()
+        .values;
+    assert_eq!(cats0, cats1, "all series must share the same category axis");
+}
+
+#[test]
+fn pivot2_q1_values_correct() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    // Q1 series: East=5000, West=3000
+    let q1 = meta
+        .pivot_series
+        .iter()
+        .find(|s| s.name.as_deref().unwrap_or("").contains("Q1"))
+        .expect("Q1 series must exist");
+    let vals = &q1.value_cache.as_ref().unwrap().values;
+    assert_eq!(vals, &[5000.0, 3000.0]);
+}
+
+#[test]
+fn pivot2_q2_values_correct() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    let meta = wb.sheets[2].charts[0].pivot_meta.as_ref().unwrap();
+    // Q2 series: East=6000, West=4500
+    let q2 = meta
+        .pivot_series
+        .iter()
+        .find(|s| s.name.as_deref().unwrap_or("").contains("Q2"))
+        .expect("Q2 series must exist");
+    let vals = &q2.value_cache.as_ref().unwrap().values;
+    assert_eq!(vals, &[6000.0, 4500.0]);
+}
+
+// ── other chart fields unaffected ─────────────────────────────────────────────
+
+#[test]
+fn pivot1_chart_type_still_bar_with_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn pivot1_is_pivot_chart_still_true_with_series() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    assert!(wb.sheets[0].charts[0].is_pivot_chart);
+}
+
+// ── regression: non-pivot charts unaffected ───────────────────────────────────
+
+#[test]
+fn sales_chart_pivot_series_absent() {
+    let wb = extract_charts(&fixture()).unwrap();
+    // No pivot_meta at all on regular charts
+    assert!(wb.sheets[0].charts[0].pivot_meta.is_none());
+}
+
+#[test]
+fn no_pivot_sheet_pivot_series_absent() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    // NoPivot sheet: pivot_meta is None → no series
+    assert!(wb.sheets[1].charts[0].pivot_meta.is_none());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 13 — Combo Chart Support
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Fixture: test_combo_charts.xlsx
+//   Sheet "BarLine"   → chart1.xml  barChart (2 series) + lineChart (1 series)
+//   Sheet "BarArea"   → chart2.xml  barChart (1 series) + areaChart (1 series)
+//   Sheet "SingleBar" → chart3.xml  barChart (2 series, regression)
+
+use sheetforge_charts::model::chart::ChartLayer;
+
+fn fixture_combo() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/test_combo_charts.xlsx")
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ── Workbook structure ────────────────────────────────────────────────────────
+
+#[test]
+fn combo_fixture_has_three_sheets() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets.len(), 3);
+}
+
+#[test]
+fn combo_fixture_sheet_names() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["BarLine", "BarArea", "SingleBar"]);
+}
+
+// ── chart_type == Combo ───────────────────────────────────────────────────────
+
+#[test]
+fn bar_line_chart_type_is_combo() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].chart_type, ChartType::Combo);
+}
+
+#[test]
+fn bar_area_chart_type_is_combo() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].chart_type, ChartType::Combo);
+}
+
+#[test]
+fn single_bar_not_combo() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[2].charts[0].chart_type, ChartType::Bar);
+}
+
+// ── layers count ─────────────────────────────────────────────────────────────
+
+#[test]
+fn bar_line_has_two_layers() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].layers.len(), 2);
+}
+
+#[test]
+fn bar_area_has_two_layers() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].layers.len(), 2);
+}
+
+#[test]
+fn single_bar_has_one_layer() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[2].charts[0].layers.len(), 1);
+}
+
+// ── layer types in order ──────────────────────────────────────────────────────
+
+#[test]
+fn bar_line_layer0_is_bar() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].layers[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn bar_line_layer1_is_line() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].layers[1].chart_type, ChartType::Line);
+}
+
+#[test]
+fn bar_area_layer0_is_bar() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].layers[0].chart_type, ChartType::Bar);
+}
+
+#[test]
+fn bar_area_layer1_is_area() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].layers[1].chart_type, ChartType::Area);
+}
+
+#[test]
+fn single_bar_layer0_is_bar() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[2].charts[0].layers[0].chart_type, ChartType::Bar);
+}
+
+// ── per-layer series counts ───────────────────────────────────────────────────
+
+#[test]
+fn bar_line_bar_layer_has_two_series() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].layers[0].series.len(), 2);
+}
+
+#[test]
+fn bar_line_line_layer_has_one_series() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].layers[1].series.len(), 1);
+}
+
+#[test]
+fn single_bar_layer_series_count() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[2].charts[0].layers[0].series.len(), 2);
+}
+
+// ── flat series mirrors all layers ───────────────────────────────────────────
+
+#[test]
+fn bar_line_flat_series_count() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    // bar layer: 2 + line layer: 1 = 3 total
+    assert_eq!(wb.sheets[0].charts[0].series.len(), 3);
+}
+
+#[test]
+fn bar_area_flat_series_count() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(wb.sheets[1].charts[0].series.len(), 2);
+}
+
+#[test]
+fn plot_area_series_mirrors_flat() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    assert_eq!(chart.plot_area.series.len(), chart.series.len());
+}
+
+// ── layer grouping ────────────────────────────────────────────────────────────
+
+#[test]
+fn bar_line_bar_layer_grouping_clustered() {
+    let wb = extract_charts(&fixture_combo()).unwrap();
+    assert_eq!(
+        wb.sheets[0].charts[0].layers[0].grouping,
+        Some(Grouping::Clustered)
+    );
+}
+
+// ── regression: non-combo charts unaffected ──────────────────────────────────
+
+#[test]
+fn sales_chart_layers_populated() {
+    // The original 2-D fixture charts must now also have layers
+    let wb = extract_charts(&fixture()).unwrap();
+    assert!(
+        !wb.sheets[0].charts[0].layers.is_empty(),
+        "even single-type charts must have at least one layer"
+    );
+}
+
+#[test]
+fn sales_chart_one_layer() {
+    let wb = extract_charts(&fixture()).unwrap();
+    assert_eq!(wb.sheets[0].charts[0].layers.len(), 1);
+}
+
+#[test]
+fn sales_chart_layer_type_matches_chart_type() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    assert_eq!(chart.layers[0].chart_type, chart.chart_type);
+}
+
+#[test]
+fn bar3d_chart_one_layer() {
+    let wb = extract_charts(&fixture_3d()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert_eq!(
+                chart.layers.len(),
+                1,
+                "3-D chart {} should have exactly 1 layer",
+                chart.chart_path
+            );
+        }
+    }
+}
+
+#[test]
+fn pivot_chart_one_layer() {
+    let wb = extract_charts(&fixture_pivot()).unwrap();
+    // All pivot fixture charts are single-type bar charts
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert_eq!(
+                chart.layers.len(),
+                1,
+                "pivot chart {} should have 1 layer",
                 chart.chart_path
             );
         }

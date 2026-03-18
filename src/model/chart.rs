@@ -299,15 +299,49 @@ impl Grouping {
     }
 }
 
+// ── ChartLayer ────────────────────────────────────────────────────────────────
+
+/// One chart-type element inside `<c:plotArea>` (e.g. one `<c:barChart>` or
+/// `<c:lineChart>`).
+///
+/// A standard single-type chart has exactly one layer.  A combo chart has two
+/// or more layers, each with its own type and series subset.
+///
+/// ```xml
+/// <c:plotArea>
+///   <c:barChart>            ← layer 0: ChartType::Bar
+///     <c:ser>…</c:ser>
+///     <c:ser>…</c:ser>
+///   </c:barChart>
+///   <c:lineChart>           ← layer 1: ChartType::Line
+///     <c:ser>…</c:ser>
+///   </c:lineChart>
+/// </c:plotArea>
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChartLayer {
+    /// The chart type for this layer.
+    pub chart_type: ChartType,
+    /// Series belonging to this layer, in document order.
+    pub series: Vec<Series>,
+    /// Grouping for this layer (`clustered`, `stacked`, etc.).
+    /// `None` when the `<c:grouping>` element is absent.
+    pub grouping: Option<Grouping>,
+    /// `true` when this is a horizontal-bar layer (`<c:barDir val="bar"/>`).
+    pub bar_horizontal: bool,
+}
+
 // ── PlotArea ─────────────────────────────────────────────────────────────────
 
 /// Everything inside `<c:plotArea>`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlotArea {
+    /// Primary chart type (type of the first layer, or `Combo` when >1 layers).
     pub chart_type: ChartType,
     pub grouping: Option<Grouping>,
     /// `true` for horizontal bars (`<c:barDir val="bar"/>`).
     pub bar_horizontal: bool,
+    /// All series across all layers, in document order (flat convenience view).
     pub series: Vec<Series>,
     pub axes: Vec<Axis>,
     pub fill: Option<Fill>,
@@ -368,6 +402,20 @@ pub struct Chart {
     /// * either the `pivotTableDefinition` or `pivotCacheDefinition` XML could
     ///   not be parsed.
     pub pivot_meta: Option<PivotTableMeta>,
+
+    /// Per-layer breakdown of the chart's plot area.
+    ///
+    /// Each [`ChartLayer`] corresponds to one chart-type element inside
+    /// `<c:plotArea>` (e.g. `<c:barChart>`, `<c:lineChart>`).
+    ///
+    /// * **Single-type chart** — one layer whose `chart_type` matches
+    ///   `self.chart_type`.
+    /// * **Combo chart** — two or more layers with different types.
+    ///   `self.chart_type` is set to [`ChartType::Combo`] in this case.
+    ///
+    /// `self.series` (flat) and `self.plot_area.series` remain fully populated
+    /// as a convenience view; `layers` gives the per-type breakdown.
+    pub layers: Vec<ChartLayer>,
 }
 
 impl Chart {
@@ -388,6 +436,7 @@ impl Chart {
             is_pivot_chart: false,
             pivot_table_name: None,
             pivot_meta: None,
+            layers: Vec::new(),
         }
     }
 }
@@ -545,5 +594,35 @@ mod chart_type_tests {
     fn chart_pivot_meta_none_by_default() {
         let c = Chart::new_skeleton("xl/charts/chart1.xml");
         assert!(c.pivot_meta.is_none());
+    }
+    #[test]
+    fn chart_layers_empty_by_default() {
+        let c = Chart::new_skeleton("xl/charts/chart1.xml");
+        assert!(c.layers.is_empty());
+    }
+
+    // ChartLayer basics
+    #[test]
+    fn chart_layer_fields() {
+        let layer = ChartLayer {
+            chart_type: ChartType::Bar,
+            series: vec![],
+            grouping: Some(Grouping::Clustered),
+            bar_horizontal: false,
+        };
+        assert_eq!(layer.chart_type, ChartType::Bar);
+        assert!(layer.series.is_empty());
+        assert_eq!(layer.grouping, Some(Grouping::Clustered));
+        assert!(!layer.bar_horizontal);
+    }
+    #[test]
+    fn chart_layer_horizontal_bar() {
+        let layer = ChartLayer {
+            chart_type: ChartType::HorizontalBar,
+            series: vec![],
+            grouping: None,
+            bar_horizontal: true,
+        };
+        assert!(layer.bar_horizontal);
     }
 }

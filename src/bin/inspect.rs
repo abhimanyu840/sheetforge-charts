@@ -97,6 +97,36 @@ fn main() {
                                     field_names.len(),
                                     field_names.join(", ")
                                 );
+                                if m.pivot_series.is_empty() {
+                                    println!("  │    cached data : (none — no pivotCacheRecords)");
+                                } else {
+                                    println!("  │    cached series [{}]:", m.pivot_series.len());
+                                    for s in &m.pivot_series {
+                                        let cats = s
+                                            .category_values
+                                            .as_ref()
+                                            .map(|c| c.values.join(", "))
+                                            .unwrap_or_default();
+                                        let vals = s
+                                            .value_cache
+                                            .as_ref()
+                                            .map(|v| {
+                                                v.values
+                                                    .iter()
+                                                    .map(|n| format!("{n:.1}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            })
+                                            .unwrap_or_default();
+                                        println!(
+                                            "  │      [{}] {}",
+                                            s.index,
+                                            s.name.as_deref().unwrap_or("(unnamed)")
+                                        );
+                                        println!("  │          cats  : [{cats}]");
+                                        println!("  │          vals  : [{vals}]");
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -182,6 +212,27 @@ fn main() {
                         fmt_fill(chart.plot_area.fill.as_ref(), wb.theme.as_ref())
                     );
 
+                    // ── Layers (Phase 13 — Combo chart support) ──────────────
+                    if chart.layers.len() > 1 {
+                        println!("  │  layers  : {} (COMBO)", chart.layers.len());
+                        for (li, layer) in chart.layers.iter().enumerate() {
+                            println!(
+                                "  │    [{}] {:?}  {} series  grouping={:?}  hbar={}",
+                                li,
+                                layer.chart_type,
+                                layer.series.len(),
+                                layer.grouping,
+                                layer.bar_horizontal,
+                            );
+                        }
+                    } else if let Some(layer) = chart.layers.first() {
+                        println!(
+                            "  │  layers  : 1  ({:?}  {} series)",
+                            layer.chart_type,
+                            layer.series.len(),
+                        );
+                    }
+
                     // ── Series ────────────────────────────────────────────────
                     println!("  │  series  : {}", chart.series.len());
                     for s in &chart.series {
@@ -245,7 +296,7 @@ fn main() {
             }
 
             println!("\n{}", "─".repeat(70));
-            println!("Done (Phases 1–11).");
+            println!("Done (Phases 1–13).");
         }
     }
 }

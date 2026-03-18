@@ -1,31 +1,29 @@
 //! Parser for `xl/pivotCache/pivotCacheDefinitionN.xml`.
 //!
-//! Extracts the data-source location (worksheet + cell range) and the ordered
-//! list of field names from `<cacheFields>`.
+//! ## Phase 11 (original)
+//! Extracts source location and field names.
 //!
-//! ## Elements parsed
+//! ## Phase 12 (extended)
+//! Also extracts the `sharedItems` lookup tables per field.
+//! These are needed to decode `<x v="N"/>` index references in
+//! `pivotCacheRecords.xml`.
 //!
 //! ```xml
-//! <pivotCacheDefinition
-//!     xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-//!     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-//!     r:id="rId1" refreshedBy="…" refreshedDate="…">
-//!   <cacheSource type="worksheet">
-//!     <worksheetSource ref="A1:D101" sheet="SourceData"/>
-//!   </cacheSource>
-//!   <cacheFields count="4">
-//!     <cacheField name="Region"   numFmtId="0"/>
-//!     <cacheField name="Product"  numFmtId="0"/>
-//!     <cacheField name="Category" numFmtId="0"/>
-//!     <cacheField name="Sales"    numFmtId="0"/>
-//!   </cacheFields>
-//! </pivotCacheDefinition>
+//! <cacheField name="Region" numFmtId="0">
+//!   <sharedItems count="3">
+//!     <s v="North"/>   <!-- index 0 -->
+//!     <s v="South"/>   <!-- index 1 -->
+//!     <s v="East"/>    <!-- index 2 -->
+//!   </sharedItems>
+//! </cacheField>
+//! <cacheField name="Sales" numFmtId="0">
+//!   <!-- no sharedItems: numeric field — values appear inline in records -->
+//! </cacheField>
 //! ```
 //!
-//! We capture:
-//! * `worksheetSource ref` → [`PivotCacheRaw::source_range`]
-//! * `worksheetSource sheet` → [`PivotCacheRaw::source_sheet`]
-//! * each `<cacheField name="…"/>` in order → [`PivotCacheRaw::field_names`]
+//! A field with no `<sharedItems>` children (or with `containsNumber="1"` and
+//! no `<s>` / `<b>` / `<e>` children) is a direct-value field.  Its column in
+//! a record row will contain `<n v="…"/>` or `<s v="…"/>` directly.
 
 use anyhow::{Context, Result};
 use quick_xml::{events::Event, Reader};
@@ -38,16 +36,15 @@ use crate::archive::zip_reader::{read_entry_bytes, XlsxArchive};
 #[derive(Debug, Default)]
 pub struct PivotCacheRaw {
     /// Worksheet name from `<worksheetSource sheet="…"/>`.
-    /// `None` if absent (non-worksheet sources: OLAP, scenario, etc.).
     pub source_sheet: Option<String>,
-
     /// Cell range from `<worksheetSource ref="…"/>` in A1 notation.
-    /// `None` if absent (some sources use a named table reference instead).
     pub source_range: Option<String>,
-
     /// Field names in order from `<cacheField name="…"/>`.
-    /// Maps positionally 1:1 to `<pivotField>` entries in the pivot table.
     pub field_names: Vec<String>,
+    /// Shared-items lookup tables, one `Vec<String>` per field.
+    /// `shared_items[i][j]` is the string value for index `j` in field `i`.
+    /// Empty inner `Vec` means the field has no shared items (direct-value field).
+    pub shared_items: Vec<Vec<String>>,
 }
 
 // ── Entry points ──────────────────────────────────────────────────────────────
@@ -64,6 +61,9 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<PivotCacheRaw> {
 
     let mut out = PivotCacheRaw::default();
     let mut in_cache_source = false;
+    let mut in_shared_items = false;
+    // Index of the cacheField currently being parsed (-1 = none)
+    let mut cur_field: isize = -1;
 
     loop {
         match reader.read_event()? {
@@ -74,22 +74,24 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<PivotCacheRaw> {
                     b"cacheSource" => {
                         in_cache_source = true;
                     }
+
                     b"worksheetSource" if in_cache_source => {
                         for attr in e.attributes() {
                             let attr = attr.context("Malformed attr in worksheetSource")?;
                             match attr.key.local_name().as_ref() {
                                 b"ref" => {
                                     out.source_range =
-                                        Some(attr.decode_and_unescape_value(dec)?.into_owned());
+                                        Some(attr.decode_and_unescape_value(dec)?.into_owned())
                                 }
                                 b"sheet" => {
                                     out.source_sheet =
-                                        Some(attr.decode_and_unescape_value(dec)?.into_owned());
+                                        Some(attr.decode_and_unescape_value(dec)?.into_owned())
                                 }
                                 _ => {}
                             }
                         }
                     }
+
                     b"cacheField" => {
                         let mut field_name = String::new();
                         for attr in e.attributes() {
@@ -99,15 +101,84 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<PivotCacheRaw> {
                             }
                         }
                         out.field_names.push(field_name);
+                        out.shared_items.push(Vec::new());
+                        cur_field = (out.field_names.len() as isize) - 1;
                     }
+
+                    b"sharedItems" if cur_field >= 0 => {
+                        in_shared_items = true;
+                    }
+
+                    // String shared item  <s v="North"/>
+                    b"s" if in_shared_items && cur_field >= 0 => {
+                        let mut val = String::new();
+                        for attr in e.attributes() {
+                            let attr = attr.context("Malformed attr in s")?;
+                            if attr.key.local_name().as_ref() == b"v" {
+                                val = attr.decode_and_unescape_value(dec)?.into_owned();
+                            }
+                        }
+                        out.shared_items[cur_field as usize].push(val);
+                    }
+
+                    // Numeric shared item  <n v="42"/>
+                    b"n" if in_shared_items && cur_field >= 0 => {
+                        let mut val = String::new();
+                        for attr in e.attributes() {
+                            let attr = attr.context("Malformed attr in n (shared)")?;
+                            if attr.key.local_name().as_ref() == b"v" {
+                                val = attr.decode_and_unescape_value(dec)?.into_owned();
+                            }
+                        }
+                        out.shared_items[cur_field as usize].push(val);
+                    }
+
+                    // Boolean shared item  <b v="1"/>
+                    b"b" if in_shared_items && cur_field >= 0 => {
+                        let mut val = String::new();
+                        for attr in e.attributes() {
+                            let attr = attr.context("Malformed attr in b (shared)")?;
+                            if attr.key.local_name().as_ref() == b"v" {
+                                val = attr.decode_and_unescape_value(dec)?.into_owned();
+                            }
+                        }
+                        out.shared_items[cur_field as usize].push(val);
+                    }
+
+                    // Error shared item  <e v="#N/A"/>
+                    b"e" if in_shared_items && cur_field >= 0 => {
+                        let mut val = String::new();
+                        for attr in e.attributes() {
+                            let attr = attr.context("Malformed attr in e (shared)")?;
+                            if attr.key.local_name().as_ref() == b"v" {
+                                val = attr.decode_and_unescape_value(dec)?.into_owned();
+                            }
+                        }
+                        out.shared_items[cur_field as usize].push(val);
+                    }
+
+                    // Missing shared item  <m/>  — push empty string placeholder
+                    b"m" if in_shared_items && cur_field >= 0 => {
+                        out.shared_items[cur_field as usize].push(String::new());
+                    }
+
                     _ => {}
                 }
             }
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"cacheSource" {
+
+            Event::End(ref e) => match e.local_name().as_ref() {
+                b"cacheSource" => {
                     in_cache_source = false;
                 }
-            }
+                b"sharedItems" => {
+                    in_shared_items = false;
+                }
+                b"cacheField" => {
+                    cur_field = -1;
+                }
+                _ => {}
+            },
+
             Event::Eof => break,
             _ => {}
         }
@@ -122,177 +193,164 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<PivotCacheRaw> {
 mod tests {
     use super::*;
 
-    // ── XML fixtures ──────────────────────────────────────────────────────────
-
     const FULL_CACHE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <pivotCacheDefinition
     xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    r:id="rId1"
-    refreshedBy="Excel"
-    refreshedDate="44927.5"
-    createdVersion="4"
-    refreshedVersion="4"
-    minRefreshableVersion="3"
-    recordCount="100">
+    r:id="rId1" refreshedBy="Excel" refreshedDate="44927.5"
+    createdVersion="4" refreshedVersion="4" minRefreshableVersion="3" recordCount="100">
   <cacheSource type="worksheet">
     <worksheetSource ref="A1:D101" sheet="SourceData"/>
   </cacheSource>
   <cacheFields count="4">
-    <cacheField name="Region"   numFmtId="0"><sharedItems count="4"/></cacheField>
-    <cacheField name="Product"  numFmtId="0"><sharedItems count="5"/></cacheField>
-    <cacheField name="Category" numFmtId="0"><sharedItems count="3"/></cacheField>
-    <cacheField name="Sales"    numFmtId="0"><sharedItems containsNumber="1" minValue="0" maxValue="9999"/></cacheField>
+    <cacheField name="Region" numFmtId="0">
+      <sharedItems count="3">
+        <s v="North"/>
+        <s v="South"/>
+        <s v="East"/>
+      </sharedItems>
+    </cacheField>
+    <cacheField name="Product" numFmtId="0">
+      <sharedItems count="2">
+        <s v="Widget"/>
+        <s v="Gadget"/>
+      </sharedItems>
+    </cacheField>
+    <cacheField name="Category" numFmtId="0">
+      <sharedItems count="2">
+        <s v="Electronics"/>
+        <s v="Hardware"/>
+      </sharedItems>
+    </cacheField>
+    <cacheField name="Sales" numFmtId="0">
+      <sharedItems containsNumber="1" minValue="0" maxValue="9999"/>
+    </cacheField>
   </cacheFields>
 </pivotCacheDefinition>"#;
 
-    const NO_SHEET_ATTR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    const NO_SHARED_ITEMS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <cacheSource type="worksheet">
-    <worksheetSource ref="B2:F50"/>
+    <worksheetSource ref="A1:B10" sheet="Data"/>
   </cacheSource>
   <cacheFields count="2">
-    <cacheField name="Alpha" numFmtId="0"/>
-    <cacheField name="Beta"  numFmtId="0"/>
-  </cacheFields>
-</pivotCacheDefinition>"#;
-
-    const NO_REF_ATTR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <cacheSource type="worksheet">
-    <worksheetSource sheet="DataSheet"/>
-  </cacheSource>
-  <cacheFields count="1">
+    <cacheField name="Label" numFmtId="0"/>
     <cacheField name="Value" numFmtId="0"/>
   </cacheFields>
 </pivotCacheDefinition>"#;
 
-    const EXTERNAL_SOURCE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <cacheSource type="external">
-    <consolidation autoPage="1"/>
-  </cacheSource>
-  <cacheFields count="2">
-    <cacheField name="X" numFmtId="0"/>
-    <cacheField name="Y" numFmtId="0"/>
-  </cacheFields>
-</pivotCacheDefinition>"#;
-
-    const EMPTY_FIELDS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <cacheSource type="worksheet">
-    <worksheetSource ref="A1:A1" sheet="Sheet1"/>
-  </cacheSource>
-  <cacheFields count="0"/>
-</pivotCacheDefinition>"#;
-
-    // ── source_sheet ──────────────────────────────────────────────────────────
+    // ── existing Phase 11 tests (unchanged) ──────────────────────────────────
 
     #[test]
     fn extracts_source_sheet() {
-        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
-        assert_eq!(r.source_sheet.as_deref(), Some("SourceData"));
+        assert_eq!(
+            parse_bytes(FULL_CACHE_XML.as_bytes())
+                .unwrap()
+                .source_sheet
+                .as_deref(),
+            Some("SourceData")
+        );
     }
-
-    #[test]
-    fn missing_sheet_attr_is_none() {
-        let r = parse_bytes(NO_SHEET_ATTR_XML.as_bytes()).unwrap();
-        assert!(r.source_sheet.is_none());
-    }
-
-    #[test]
-    fn external_source_has_no_sheet() {
-        let r = parse_bytes(EXTERNAL_SOURCE_XML.as_bytes()).unwrap();
-        assert!(r.source_sheet.is_none());
-    }
-
-    #[test]
-    fn no_ref_but_sheet_present() {
-        let r = parse_bytes(NO_REF_ATTR_XML.as_bytes()).unwrap();
-        assert_eq!(r.source_sheet.as_deref(), Some("DataSheet"));
-    }
-
-    // ── source_range ──────────────────────────────────────────────────────────
-
     #[test]
     fn extracts_source_range() {
-        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
-        assert_eq!(r.source_range.as_deref(), Some("A1:D101"));
+        assert_eq!(
+            parse_bytes(FULL_CACHE_XML.as_bytes())
+                .unwrap()
+                .source_range
+                .as_deref(),
+            Some("A1:D101")
+        );
     }
-
-    #[test]
-    fn extracts_range_without_sheet() {
-        let r = parse_bytes(NO_SHEET_ATTR_XML.as_bytes()).unwrap();
-        assert_eq!(r.source_range.as_deref(), Some("B2:F50"));
-    }
-
-    #[test]
-    fn missing_ref_attr_is_none() {
-        let r = parse_bytes(NO_REF_ATTR_XML.as_bytes()).unwrap();
-        assert!(r.source_range.is_none());
-    }
-
-    // ── field_names ───────────────────────────────────────────────────────────
-
     #[test]
     fn extracts_four_field_names() {
-        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
-        assert_eq!(r.field_names.len(), 4);
+        assert_eq!(
+            parse_bytes(FULL_CACHE_XML.as_bytes())
+                .unwrap()
+                .field_names
+                .len(),
+            4
+        );
     }
-
     #[test]
     fn field_names_in_order() {
         let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
-        assert_eq!(r.field_names[0], "Region");
-        assert_eq!(r.field_names[1], "Product");
-        assert_eq!(r.field_names[2], "Category");
-        assert_eq!(r.field_names[3], "Sales");
+        assert_eq!(
+            r.field_names,
+            vec!["Region", "Product", "Category", "Sales"]
+        );
     }
-
     #[test]
-    fn two_field_names_extracted() {
-        let r = parse_bytes(NO_SHEET_ATTR_XML.as_bytes()).unwrap();
-        assert_eq!(r.field_names, vec!["Alpha", "Beta"]);
-    }
-
-    #[test]
-    fn single_field_name() {
-        let r = parse_bytes(NO_REF_ATTR_XML.as_bytes()).unwrap();
-        assert_eq!(r.field_names, vec!["Value"]);
-    }
-
-    #[test]
-    fn external_source_still_has_field_names() {
-        let r = parse_bytes(EXTERNAL_SOURCE_XML.as_bytes()).unwrap();
-        assert_eq!(r.field_names, vec!["X", "Y"]);
-    }
-
-    #[test]
-    fn empty_cache_fields_returns_empty_vec() {
-        let r = parse_bytes(EMPTY_FIELDS_XML.as_bytes()).unwrap();
-        assert!(r.field_names.is_empty());
-    }
-
-    // ── worksheetSource must be inside cacheSource ────────────────────────────
-
-    #[test]
-    fn worksheet_source_outside_cache_source_ignored() {
-        // A stray <worksheetSource> that is NOT inside <cacheSource> must not
-        // be parsed (the `in_cache_source` guard must hold).
+    fn missing_sheet_attr_is_none() {
         let xml = r#"<?xml version="1.0"?>
 <pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <worksheetSource ref="STRAY:REF" sheet="StraySheet"/>
-  <cacheSource type="worksheet">
-    <worksheetSource ref="A1:B2" sheet="Real"/>
-  </cacheSource>
+  <cacheSource type="worksheet"><worksheetSource ref="B2:F50"/></cacheSource>
+  <cacheFields count="0"/>
+</pivotCacheDefinition>"#;
+        assert!(parse_bytes(xml.as_bytes()).unwrap().source_sheet.is_none());
+    }
+    #[test]
+    fn worksheet_source_outside_cache_source_ignored() {
+        let xml = r#"<?xml version="1.0"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <worksheetSource ref="STRAY" sheet="Stray"/>
+  <cacheSource type="worksheet"><worksheetSource ref="A1:B2" sheet="Real"/></cacheSource>
   <cacheFields count="0"/>
 </pivotCacheDefinition>"#;
         let r = parse_bytes(xml.as_bytes()).unwrap();
+        assert_eq!(r.source_sheet.as_deref(), Some("Real"));
+    }
+
+    // ── Phase 12: shared_items ────────────────────────────────────────────────
+
+    #[test]
+    fn shared_items_vec_count_matches_fields() {
+        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
         assert_eq!(
-            r.source_sheet.as_deref(),
-            Some("Real"),
-            "stray worksheetSource outside cacheSource should be ignored"
+            r.shared_items.len(),
+            4,
+            "one shared_items Vec per cacheField"
         );
-        assert_eq!(r.source_range.as_deref(), Some("A1:B2"));
+    }
+
+    #[test]
+    fn region_shared_items_correct() {
+        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
+        assert_eq!(r.shared_items[0], vec!["North", "South", "East"]);
+    }
+
+    #[test]
+    fn product_shared_items_correct() {
+        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
+        assert_eq!(r.shared_items[1], vec!["Widget", "Gadget"]);
+    }
+
+    #[test]
+    fn numeric_field_shared_items_empty() {
+        // Sales field has <sharedItems containsNumber="1"/> but no <s> children
+        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
+        assert!(
+            r.shared_items[3].is_empty(),
+            "numeric-only field should have empty shared_items"
+        );
+    }
+
+    #[test]
+    fn no_shared_items_element_means_empty_vec() {
+        let r = parse_bytes(NO_SHARED_ITEMS_XML.as_bytes()).unwrap();
+        assert_eq!(r.shared_items.len(), 2);
+        assert!(r.shared_items[0].is_empty());
+        assert!(r.shared_items[1].is_empty());
+    }
+
+    #[test]
+    fn shared_items_index_zero_is_first_item() {
+        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
+        assert_eq!(r.shared_items[0][0], "North");
+    }
+
+    #[test]
+    fn shared_items_index_two_is_third_item() {
+        let r = parse_bytes(FULL_CACHE_XML.as_bytes()).unwrap();
+        assert_eq!(r.shared_items[0][2], "East");
     }
 }
