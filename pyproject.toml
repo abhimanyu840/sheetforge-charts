@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name            = "sheetforge-charts"
-version         = "0.1.0"
+version         = "0.1.1"
 description     = "High-performance Excel chart metadata extractor — Rust core with Python bindings"
 readme          = "README.md"
 license         = { text = "MIT" }
