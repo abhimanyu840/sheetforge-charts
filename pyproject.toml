@@ -24,9 +24,7 @@ classifiers     = [
 ]
 
 [tool.maturin]
-# Enables PyO3 bindings
 features      = ["python"]
-# The pure-Python wrapper package lives here
 python-source = "python"
-# The native .pyd/.so is installed as sheetforge_charts._core
 module-name   = "sheetforge_charts._core"
+bindings      = "pyo3"
