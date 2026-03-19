@@ -20,7 +20,10 @@ use anyhow::{Context, Result};
 
 use crate::{
     archive::zip_reader::XlsxArchive,
-    model::{chart::Chart, workbook::SheetCharts},
+    model::{
+        chart::{Chart, ChartPosition},
+        workbook::SheetCharts,
+    },
     openxml::{
         drawing,
         relationships::{rel_type, RelationshipResolver},
@@ -89,9 +92,13 @@ fn resolve_sheet(
                     )
                 })?;
 
-            // ── Step 5: record skeleton chart with anchor ─────────────────────
+            // ── Step 5: record skeleton chart with anchor + position ──────────
             let mut chart = Chart::new_skeleton(chart_path);
             chart.anchor = chart_ref.anchor.clone();
+            // Build human-readable position from the anchor (sheet name known here)
+            if let Some(anchor) = &chart_ref.anchor {
+                chart.position = Some(ChartPosition::from_anchor(anchor, &sheet.name));
+            }
             sheet.charts.push(chart);
         }
     }

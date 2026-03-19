@@ -1,29 +1,35 @@
 //! Parser for `xl/drawings/drawingN.xml`.
 //!
-//! Extracts every `<xdr:twoCellAnchor>` and pairs it with the
-//! `<c:chart r:id="…"/>` reference nested inside it so that callers
-//! can attach worksheet-position data to each [`Chart`] skeleton.
+//! Extracts every `<xdr:twoCellAnchor>` **and** `<xdr:oneCellAnchor>` and
+//! pairs each with the `<c:chart r:id="…"/>` reference nested inside it.
 //!
-//! ## XML structure
+//! ## XML structures
 //!
+//! ### twoCellAnchor (most common)
 //! ```xml
-//! <xdr:wsDr …>
-//!   <xdr:twoCellAnchor>
-//!     <xdr:from>
-//!       <xdr:col>0</xdr:col>   <xdr:colOff>0</xdr:colOff>
-//!       <xdr:row>0</xdr:row>   <xdr:rowOff>0</xdr:rowOff>
-//!     </xdr:from>
-//!     <xdr:to>
-//!       <xdr:col>8</xdr:col>   <xdr:colOff>0</xdr:colOff>
-//!       <xdr:row>15</xdr:row>  <xdr:rowOff>0</xdr:rowOff>
-//!     </xdr:to>
-//!     <xdr:graphicFrame>
-//!       …
-//!       <c:chart r:id="rId1"/>
-//!       …
-//!     </xdr:graphicFrame>
-//!   </xdr:twoCellAnchor>
-//! </xdr:wsDr>
+//! <xdr:twoCellAnchor>
+//!   <xdr:from>
+//!     <xdr:col>0</xdr:col>  <xdr:colOff>0</xdr:colOff>
+//!     <xdr:row>0</xdr:row>  <xdr:rowOff>0</xdr:rowOff>
+//!   </xdr:from>
+//!   <xdr:to>
+//!     <xdr:col>8</xdr:col>  <xdr:colOff>0</xdr:colOff>
+//!     <xdr:row>15</xdr:row> <xdr:rowOff>0</xdr:rowOff>
+//!   </xdr:to>
+//!   <xdr:graphicFrame>…<c:chart r:id="rId1"/>…</xdr:graphicFrame>
+//! </xdr:twoCellAnchor>
+//! ```
+//!
+//! ### oneCellAnchor (less common)
+//! ```xml
+//! <xdr:oneCellAnchor>
+//!   <xdr:from>
+//!     <xdr:col>5</xdr:col>  <xdr:colOff>0</xdr:colOff>
+//!     <xdr:row>1</xdr:row>  <xdr:rowOff>0</xdr:rowOff>
+//!   </xdr:from>
+//!   <xdr:ext cx="3000000" cy="2000000"/>   ← EMU width/height
+//!   <xdr:graphicFrame>…<c:chart r:id="rId1"/>…</xdr:graphicFrame>
+//! </xdr:oneCellAnchor>
 //! ```
 
 use anyhow::{Context, Result};
@@ -84,13 +90,32 @@ pub(crate) fn parse_xml(xml: &str) -> Result<DrawingChartRefs> {
                 let tag = std::str::from_utf8(ln.as_ref()).unwrap_or("");
 
                 match tag {
-                    "twoCellAnchor" => st.begin_anchor(),
+                    "twoCellAnchor" => st.begin_anchor(AnchorKind::TwoCell),
+                    "oneCellAnchor" => st.begin_anchor(AnchorKind::OneCell),
                     "from" => st.corner = Corner::From,
                     "to" => st.corner = Corner::To,
                     "col" => st.pending = Some(Field::Col),
                     "colOff" => st.pending = Some(Field::ColOff),
                     "row" => st.pending = Some(Field::Row),
                     "rowOff" => st.pending = Some(Field::RowOff),
+                    // <xdr:ext cx="…" cy="…"/> — present in oneCellAnchor
+                    "ext" if st.anchor_kind == AnchorKind::OneCell => {
+                        let dec = reader.decoder();
+                        for attr in e.attributes() {
+                            let attr = attr.context("Malformed attr in <xdr:ext>")?;
+                            match attr.key.local_name().as_ref() {
+                                b"cx" => {
+                                    st.ext_cx =
+                                        attr.decode_and_unescape_value(dec)?.parse().unwrap_or(0);
+                                }
+                                b"cy" => {
+                                    st.ext_cy =
+                                        attr.decode_and_unescape_value(dec)?.parse().unwrap_or(0);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     "chart" => {
                         if let Some(rel_id) = extract_r_id(e, reader.decoder())? {
                             st.pending_rel_id = Some(rel_id);
@@ -118,7 +143,16 @@ pub(crate) fn parse_xml(xml: &str) -> Result<DrawingChartRefs> {
                         if let Some(rel_id) = st.pending_rel_id.take() {
                             result.refs.push(ChartRef {
                                 rel_id,
-                                anchor: Some(st.build()),
+                                anchor: Some(st.build_two_cell()),
+                            });
+                        }
+                        st.reset();
+                    }
+                    "oneCellAnchor" => {
+                        if let Some(rel_id) = st.pending_rel_id.take() {
+                            result.refs.push(ChartRef {
+                                rel_id,
+                                anchor: Some(st.build_one_cell()),
                             });
                         }
                         st.reset();
@@ -145,6 +179,15 @@ enum Corner {
     To,
 }
 
+/// Which anchor element we are currently inside.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum AnchorKind {
+    #[default]
+    None,
+    TwoCell,
+    OneCell,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Field {
     Col,
@@ -155,6 +198,7 @@ enum Field {
 
 #[derive(Debug, Default)]
 struct State {
+    anchor_kind: AnchorKind,
     corner: Corner,
     pending: Option<Field>,
     pending_rel_id: Option<String>,
@@ -166,14 +210,20 @@ struct State {
     to_col_off: i64,
     to_row: u32,
     to_row_off: i64,
+    /// EMU width from `<xdr:ext cx="…"/>` (oneCellAnchor only).
+    ext_cx: i64,
+    /// EMU height from `<xdr:ext cy="…"/>` (oneCellAnchor only).
+    ext_cy: i64,
 }
 
 impl State {
-    fn begin_anchor(&mut self) {
+    fn begin_anchor(&mut self, kind: AnchorKind) {
         self.reset();
+        self.anchor_kind = kind;
     }
 
     fn reset(&mut self) {
+        self.anchor_kind = AnchorKind::None;
         self.corner = Corner::None;
         self.pending = None;
         self.from_col = 0;
@@ -184,7 +234,9 @@ impl State {
         self.to_col_off = 0;
         self.to_row = 0;
         self.to_row_off = 0;
-        // pending_rel_id is consumed at </twoCellAnchor> close, not here
+        self.ext_cx = 0;
+        self.ext_cy = 0;
+        // pending_rel_id is consumed at anchor-close, not here
     }
 
     fn apply(&mut self, field: Field, text: &str) {
@@ -226,7 +278,7 @@ impl State {
         }
     }
 
-    fn build(&self) -> ChartAnchor {
+    fn build_two_cell(&self) -> ChartAnchor {
         ChartAnchor {
             col_start: self.from_col,
             col_off: self.from_col_off,
@@ -236,6 +288,21 @@ impl State {
             col_end_off: self.to_col_off,
             row_end: self.to_row,
             row_end_off: self.to_row_off,
+        }
+    }
+
+    /// Build a `ChartAnchor` from a oneCellAnchor: col/row end = col/row start
+    /// (we don't know the exact end cell without column/row pixel data).
+    fn build_one_cell(&self) -> ChartAnchor {
+        ChartAnchor {
+            col_start: self.from_col,
+            col_off: self.from_col_off,
+            row_start: self.from_row,
+            row_off: self.from_row_off,
+            col_end: self.from_col,
+            col_end_off: self.ext_cx, // store EMU width in col_end_off for callers
+            row_end: self.from_row,
+            row_end_off: self.ext_cy, // store EMU height in row_end_off
         }
     }
 }
@@ -488,5 +555,126 @@ mod tests {
     fn two_anchors_are_not_equal() {
         let refs = parse_xml(TWO_CHARTS).unwrap();
         assert_ne!(refs.refs[0].anchor, refs.refs[1].anchor);
+    }
+
+    // ── oneCellAnchor ─────────────────────────────────────────────────────────
+
+    const ONE_CELL_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr
+  xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <xdr:oneCellAnchor>
+    <xdr:from>
+      <xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff>
+      <xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff>
+    </xdr:from>
+    <xdr:ext cx="3000000" cy="2000000"/>
+    <xdr:graphicFrame>
+      <a:graphic><a:graphicData>
+        <c:chart r:id="rId2"/>
+      </a:graphicData></a:graphic>
+    </xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#;
+
+    #[test]
+    fn one_cell_anchor_found() {
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn one_cell_rel_id() {
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert_eq!(refs.refs[0].rel_id, "rId2");
+    }
+
+    #[test]
+    fn one_cell_anchor_present() {
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert!(refs.refs[0].anchor.is_some());
+    }
+
+    #[test]
+    fn one_cell_col_start() {
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert_eq!(refs.refs[0].anchor.as_ref().unwrap().col_start, 5);
+    }
+
+    #[test]
+    fn one_cell_row_start() {
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert_eq!(refs.refs[0].anchor.as_ref().unwrap().row_start, 1);
+    }
+
+    #[test]
+    fn one_cell_ext_cx_stored_in_col_end_off() {
+        // For oneCellAnchor, ext cx is stored in col_end_off for downstream use
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert_eq!(refs.refs[0].anchor.as_ref().unwrap().col_end_off, 3000000);
+    }
+
+    #[test]
+    fn one_cell_ext_cy_stored_in_row_end_off() {
+        let refs = parse_xml(ONE_CELL_XML).unwrap();
+        assert_eq!(refs.refs[0].anchor.as_ref().unwrap().row_end_off, 2000000);
+    }
+
+    /// Mixed: one twoCellAnchor + one oneCellAnchor
+    const MIXED_ANCHOR_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr
+  xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff>
+              <xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to>  <xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff>
+              <xdr:row>15</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:graphicFrame><a:graphic><a:graphicData>
+      <c:chart r:id="rId1"/>
+    </a:graphicData></a:graphic></xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff>
+              <xdr:row>17</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:ext cx="4572000" cy="2743200"/>
+    <xdr:graphicFrame><a:graphic><a:graphicData>
+      <c:chart r:id="rId2"/>
+    </a:graphicData></a:graphic></xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#;
+
+    #[test]
+    fn mixed_two_refs_found() {
+        let refs = parse_xml(MIXED_ANCHOR_XML).unwrap();
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn mixed_first_is_two_cell() {
+        let refs = parse_xml(MIXED_ANCHOR_XML).unwrap();
+        let a = refs.refs[0].anchor.as_ref().unwrap();
+        // twoCellAnchor: col_end=8 (different from col_start=0)
+        assert_eq!(a.col_start, 0);
+        assert_eq!(a.col_end, 8);
+    }
+
+    #[test]
+    fn mixed_second_is_one_cell() {
+        let refs = parse_xml(MIXED_ANCHOR_XML).unwrap();
+        let a = refs.refs[1].anchor.as_ref().unwrap();
+        // oneCellAnchor: col_start=2, col_end=col_start=2
+        assert_eq!(a.col_start, 2);
+        assert_eq!(a.row_start, 17);
+        // ext stored in offsets
+        assert_eq!(a.col_end_off, 4572000);
+        assert_eq!(a.row_end_off, 2743200);
     }
 }

@@ -1,11 +1,130 @@
 //! [`Chart`] model, [`ChartType`], [`LegendPosition`], [`PlotArea`],
-//! [`ChartAnchor`], [`Chart3DView`], and [`Chart3DSurface`].
+//! [`ChartAnchor`], [`Chart3DView`], [`Chart3DSurface`], and [`ChartPosition`].
 
 use serde::{Deserialize, Serialize};
 
 use super::{axis::Axis, series::Series};
 use crate::model::color::Fill;
 use crate::model::pivot::PivotTableMeta;
+
+// ── ChartPosition ─────────────────────────────────────────────────────────────
+
+/// Human-readable placement of a chart on its worksheet.
+///
+/// Derived from the raw [`ChartAnchor`] after the sheet name is known.
+/// Cell addresses use standard **A1 notation** (column letters + 1-based row).
+///
+/// ## Example
+/// ```
+/// # use sheetforge_charts::model::chart::ChartPosition;
+/// let pos = ChartPosition {
+///     sheet:        "Sales".to_owned(),
+///     top_left:     "B2".to_owned(),   // col=1, row=1  (0-based → B, 2)
+///     bottom_right: "J17".to_owned(),  // col=9, row=16 (0-based → J, 17)
+///     width_emu:    None,
+///     height_emu:   None,
+/// };
+/// assert_eq!(pos.top_left, "B2");
+/// ```
+///
+/// For `twoCellAnchor` charts, both corners are exact.
+/// For `oneCellAnchor` charts, `bottom_right` is computed from the
+/// top-left corner plus the `<xdr:ext cx cy/>` EMU dimensions; it is
+/// an approximation because column/row pixel sizes vary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChartPosition {
+    /// Display name of the worksheet this chart lives on.
+    pub sheet: String,
+
+    /// Top-left cell in A1 notation (e.g. `"B2"`).
+    ///
+    /// Derived from `ChartAnchor::col_start` and `ChartAnchor::row_start`,
+    /// both of which are **0-based** in the raw XML.
+    pub top_left: String,
+
+    /// Bottom-right cell in A1 notation (e.g. `"J17"`).
+    ///
+    /// Derived from `ChartAnchor::col_end` and `ChartAnchor::row_end`.
+    /// For `oneCellAnchor` charts this is estimated from the EMU extent.
+    pub bottom_right: String,
+
+    /// Chart width in **English Metric Units** (EMU).
+    ///
+    /// `Some` for `oneCellAnchor` charts (from `<xdr:ext cx="…"/>`).
+    /// `None` for `twoCellAnchor` charts (width is implicit from the corner delta).
+    pub width_emu: Option<i64>,
+
+    /// Chart height in **English Metric Units** (EMU).
+    ///
+    /// `Some` for `oneCellAnchor` charts (from `<xdr:ext cy="…"/>`).
+    /// `None` for `twoCellAnchor` charts.
+    pub height_emu: Option<i64>,
+}
+
+impl ChartPosition {
+    /// Convert a 0-based column index to an Excel column letter string.
+    ///
+    /// ```
+    /// # use sheetforge_charts::model::chart::ChartPosition;
+    /// assert_eq!(ChartPosition::col_to_letter(0),  "A");
+    /// assert_eq!(ChartPosition::col_to_letter(25), "Z");
+    /// assert_eq!(ChartPosition::col_to_letter(26), "AA");
+    /// assert_eq!(ChartPosition::col_to_letter(701), "ZZ");
+    /// ```
+    pub fn col_to_letter(mut col: u32) -> String {
+        let mut result = Vec::new();
+        loop {
+            result.push((b'A' + (col % 26) as u8) as char);
+            if col < 26 {
+                break;
+            }
+            col = col / 26 - 1;
+        }
+        result.iter().rev().collect()
+    }
+
+    /// Build an A1-notation cell address from 0-based column and row indices.
+    ///
+    /// ```
+    /// # use sheetforge_charts::model::chart::ChartPosition;
+    /// assert_eq!(ChartPosition::cell_address(0, 0), "A1");
+    /// assert_eq!(ChartPosition::cell_address(1, 1), "B2");
+    /// assert_eq!(ChartPosition::cell_address(25, 9), "Z10");
+    /// ```
+    pub fn cell_address(col: u32, row: u32) -> String {
+        format!("{}{}", Self::col_to_letter(col), row + 1)
+    }
+
+    /// Build a `ChartPosition` from a [`ChartAnchor`] and a sheet name.
+    ///
+    /// `width_emu` and `height_emu` are `None` for `twoCellAnchor` sources.
+    pub fn from_anchor(anchor: &ChartAnchor, sheet: impl Into<String>) -> Self {
+        Self {
+            sheet: sheet.into(),
+            top_left: Self::cell_address(anchor.col_start, anchor.row_start),
+            bottom_right: Self::cell_address(anchor.col_end, anchor.row_end),
+            width_emu: None,
+            height_emu: None,
+        }
+    }
+
+    /// Build a `ChartPosition` from a `oneCellAnchor` source where only the
+    /// top-left corner and EMU dimensions are known.
+    ///
+    /// `bottom_right` is set equal to `top_left` (the extent in rows/cols
+    /// would require knowing column-width / row-height pixel values, which are
+    /// sheet-specific and not parsed here).
+    pub fn from_one_cell(col: u32, row: u32, cx: i64, cy: i64, sheet: impl Into<String>) -> Self {
+        let tl = Self::cell_address(col, row);
+        Self {
+            sheet: sheet.into(),
+            top_left: tl.clone(),
+            bottom_right: tl, // extent unknown without column-width data
+            width_emu: Some(cx),
+            height_emu: Some(cy),
+        }
+    }
+}
 
 // ── ChartAnchor ───────────────────────────────────────────────────────────────
 
@@ -423,6 +542,13 @@ pub struct Chart {
     /// `self.series` (flat) and `self.plot_area.series` remain fully populated
     /// as a convenience view; `layers` gives the per-type breakdown.
     pub layers: Vec<ChartLayer>,
+
+    /// Human-readable placement of this chart on its worksheet.
+    ///
+    /// Populated after Phase 2 relationship resolution when the sheet name and
+    /// drawing anchor are both available.  `None` for chart-sheets (charts that
+    /// occupy an entire sheet rather than being embedded in a worksheet).
+    pub position: Option<ChartPosition>,
 }
 
 impl Chart {
@@ -444,6 +570,7 @@ impl Chart {
             pivot_table_name: None,
             pivot_meta: None,
             layers: Vec::new(),
+            position: None,
         }
     }
 }
@@ -607,6 +734,11 @@ mod chart_type_tests {
         let c = Chart::new_skeleton("xl/charts/chart1.xml");
         assert!(c.layers.is_empty());
     }
+    #[test]
+    fn chart_position_none_by_default() {
+        let c = Chart::new_skeleton("xl/charts/chart1.xml");
+        assert!(c.position.is_none());
+    }
 
     // ChartLayer basics
     #[test]
@@ -633,5 +765,168 @@ mod chart_type_tests {
             axis_ids: vec![1, 2],
         };
         assert!(layer.bar_horizontal);
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    // ── col_to_letter ─────────────────────────────────────────────────────────
+    #[test]
+    fn col_a() {
+        assert_eq!(ChartPosition::col_to_letter(0), "A");
+    }
+    #[test]
+    fn col_b() {
+        assert_eq!(ChartPosition::col_to_letter(1), "B");
+    }
+    #[test]
+    fn col_z() {
+        assert_eq!(ChartPosition::col_to_letter(25), "Z");
+    }
+    #[test]
+    fn col_aa() {
+        assert_eq!(ChartPosition::col_to_letter(26), "AA");
+    }
+    #[test]
+    fn col_ab() {
+        assert_eq!(ChartPosition::col_to_letter(27), "AB");
+    }
+    #[test]
+    fn col_az() {
+        assert_eq!(ChartPosition::col_to_letter(51), "AZ");
+    }
+    #[test]
+    fn col_ba() {
+        assert_eq!(ChartPosition::col_to_letter(52), "BA");
+    }
+    #[test]
+    fn col_zz() {
+        assert_eq!(ChartPosition::col_to_letter(701), "ZZ");
+    }
+
+    // ── cell_address ──────────────────────────────────────────────────────────
+    #[test]
+    fn cell_a1() {
+        assert_eq!(ChartPosition::cell_address(0, 0), "A1");
+    }
+    #[test]
+    fn cell_b2() {
+        assert_eq!(ChartPosition::cell_address(1, 1), "B2");
+    }
+    #[test]
+    fn cell_z10() {
+        assert_eq!(ChartPosition::cell_address(25, 9), "Z10");
+    }
+    #[test]
+    fn cell_j17() {
+        assert_eq!(ChartPosition::cell_address(9, 16), "J17");
+    }
+    #[test]
+    fn cell_aa1() {
+        assert_eq!(ChartPosition::cell_address(26, 0), "AA1");
+    }
+
+    // ── from_anchor ───────────────────────────────────────────────────────────
+    #[test]
+    fn from_anchor_sheet_name() {
+        let a = ChartAnchor {
+            col_start: 0,
+            col_off: 0,
+            row_start: 0,
+            row_off: 0,
+            col_end: 8,
+            col_end_off: 0,
+            row_end: 15,
+            row_end_off: 0,
+        };
+        let p = ChartPosition::from_anchor(&a, "Sales");
+        assert_eq!(p.sheet, "Sales");
+    }
+    #[test]
+    fn from_anchor_top_left() {
+        let a = ChartAnchor {
+            col_start: 1,
+            col_off: 0,
+            row_start: 1,
+            row_off: 0,
+            col_end: 9,
+            col_end_off: 0,
+            row_end: 16,
+            row_end_off: 0,
+        };
+        let p = ChartPosition::from_anchor(&a, "S");
+        assert_eq!(p.top_left, "B2");
+    }
+    #[test]
+    fn from_anchor_bottom_right() {
+        let a = ChartAnchor {
+            col_start: 1,
+            col_off: 0,
+            row_start: 1,
+            row_off: 0,
+            col_end: 9,
+            col_end_off: 0,
+            row_end: 16,
+            row_end_off: 0,
+        };
+        let p = ChartPosition::from_anchor(&a, "S");
+        assert_eq!(p.bottom_right, "J17");
+    }
+    #[test]
+    fn from_anchor_width_height_none() {
+        let a = ChartAnchor {
+            col_start: 0,
+            col_off: 0,
+            row_start: 0,
+            row_off: 0,
+            col_end: 8,
+            col_end_off: 0,
+            row_end: 15,
+            row_end_off: 0,
+        };
+        let p = ChartPosition::from_anchor(&a, "S");
+        assert!(p.width_emu.is_none());
+        assert!(p.height_emu.is_none());
+    }
+    #[test]
+    fn from_anchor_a1_origin() {
+        let a = ChartAnchor {
+            col_start: 0,
+            col_off: 0,
+            row_start: 0,
+            row_off: 0,
+            col_end: 5,
+            col_end_off: 0,
+            row_end: 10,
+            row_end_off: 0,
+        };
+        let p = ChartPosition::from_anchor(&a, "Sheet1");
+        assert_eq!(p.top_left, "A1");
+        assert_eq!(p.bottom_right, "F11");
+    }
+
+    // ── from_one_cell ─────────────────────────────────────────────────────────
+    #[test]
+    fn from_one_cell_top_left() {
+        let p = ChartPosition::from_one_cell(5, 1, 3000000, 2000000, "Sheet2");
+        assert_eq!(p.top_left, "F2");
+    }
+    #[test]
+    fn from_one_cell_bottom_right_equals_top_left() {
+        let p = ChartPosition::from_one_cell(5, 1, 3000000, 2000000, "Sheet2");
+        assert_eq!(p.top_left, p.bottom_right);
+    }
+    #[test]
+    fn from_one_cell_width_height() {
+        let p = ChartPosition::from_one_cell(0, 0, 4572000, 2743200, "S");
+        assert_eq!(p.width_emu, Some(4572000));
+        assert_eq!(p.height_emu, Some(2743200));
+    }
+    #[test]
+    fn from_one_cell_sheet_name() {
+        let p = ChartPosition::from_one_cell(0, 0, 1, 1, "MySheet");
+        assert_eq!(p.sheet, "MySheet");
     }
 }

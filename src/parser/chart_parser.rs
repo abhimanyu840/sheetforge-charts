@@ -1158,13 +1158,14 @@ impl ParseState {
             series,
             axes,
             chart_fill: self.chart_fill,
-            anchor: None,
+            anchor: None, // set by sheet_parser after drawing anchor resolved
             view_3d,
             surface,
             is_pivot_chart: self.pending_pivot_name.is_some(),
             pivot_table_name: self.pending_pivot_name,
-            pivot_meta: None,
+            pivot_meta: None, // resolved in lib.rs Phase A5 after parse
             layers,
+            position: None, // set by sheet_parser after sheet name is known
         }
     }
 }

@@ -148,6 +148,15 @@ fn main() {
                         ),
                     }
 
+                    // Human-readable position (Phase 15)
+                    match &chart.position {
+                        None => println!("  │  position: (none)"),
+                        Some(p) => println!(
+                            "  │  position: {}  {}:{}",
+                            p.sheet, p.top_left, p.bottom_right,
+                        ),
+                    }
+
                     // 3-D view (only printed for 3-D chart types)
                     if chart.chart_type.is_3d() {
                         match &chart.view_3d {
@@ -304,7 +313,7 @@ fn main() {
             }
 
             println!("\n{}", "─".repeat(70));
-            println!("Done (Phases 1–14).");
+            println!("Done (Phases 1–15).");
         }
     }
 }

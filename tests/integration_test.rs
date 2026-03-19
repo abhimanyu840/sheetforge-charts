@@ -585,6 +585,8 @@ fn non_zip_file_returns_error() {
 //   5   HBar3D      c:bar3DChart        bar      20    15     1     (none)
 // ═════════════════════════════════════════════════════════════════════════════
 
+use sheetforge_charts::model::chart::Chart3DView;
+
 fn fixture_3d() -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/test_3d_charts.xlsx")
@@ -2422,5 +2424,209 @@ fn combo_fixture_primary_series_not_secondary() {
             !s.is_secondary_axis,
             "bar layer in combo fixture must be primary"
         );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 15 — Chart Placement (ChartPosition)
+// ═════════════════════════════════════════════════════════════════════════════
+
+use sheetforge_charts::model::chart::ChartPosition;
+
+// ── ChartPosition present ─────────────────────────────────────────────────────
+
+#[test]
+fn sales_chart_has_position() {
+    let wb = extract_charts(&fixture()).unwrap();
+    assert!(
+        wb.sheets[0].charts[0].position.is_some(),
+        "Sales chart must have a ChartPosition"
+    );
+}
+
+#[test]
+fn expenses_chart_has_position() {
+    let wb = extract_charts(&fixture()).unwrap();
+    assert!(wb.sheets[1].charts[0].position.is_some());
+}
+
+// ── sheet name in position ────────────────────────────────────────────────────
+
+#[test]
+fn sales_chart_position_sheet_name() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[0].charts[0].position.as_ref().unwrap();
+    assert_eq!(pos.sheet, "Sales");
+}
+
+#[test]
+fn expenses_chart_position_sheet_name() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[1].charts[0].position.as_ref().unwrap();
+    assert_eq!(pos.sheet, "Expenses");
+}
+
+// ── top_left / bottom_right A1 notation ──────────────────────────────────────
+
+#[test]
+fn sales_chart_position_top_left_a1() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[0].charts[0].position.as_ref().unwrap();
+    // anchor.col_start=0, row_start=0 → A1
+    assert_eq!(pos.top_left, "A1");
+}
+
+#[test]
+fn sales_chart_position_bottom_right_format() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[0].charts[0].position.as_ref().unwrap();
+    // bottom_right must be a non-empty A1-notation string
+    assert!(!pos.bottom_right.is_empty());
+    // must start with a letter
+    assert!(pos
+        .bottom_right
+        .chars()
+        .next()
+        .unwrap()
+        .is_ascii_uppercase());
+    // must end with a digit
+    assert!(pos.bottom_right.chars().last().unwrap().is_ascii_digit());
+}
+
+#[test]
+fn position_top_left_and_bottom_right_differ_for_two_cell() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[0].charts[0].position.as_ref().unwrap();
+    // twoCellAnchor: bottom_right must be further than top_left
+    assert_ne!(
+        pos.top_left, pos.bottom_right,
+        "twoCellAnchor chart must have distinct top_left and bottom_right"
+    );
+}
+
+// ── consistency with ChartAnchor ─────────────────────────────────────────────
+
+#[test]
+fn position_consistent_with_anchor_col_start() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    let anchor = chart.anchor.as_ref().unwrap();
+    let pos = chart.position.as_ref().unwrap();
+    let expected_tl = ChartPosition::cell_address(anchor.col_start, anchor.row_start);
+    assert_eq!(pos.top_left, expected_tl);
+}
+
+#[test]
+fn position_consistent_with_anchor_col_end() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let chart = &wb.sheets[0].charts[0];
+    let anchor = chart.anchor.as_ref().unwrap();
+    let pos = chart.position.as_ref().unwrap();
+    let expected_br = ChartPosition::cell_address(anchor.col_end, anchor.row_end);
+    assert_eq!(pos.bottom_right, expected_br);
+}
+
+// ── width_emu / height_emu (None for twoCellAnchor) ──────────────────────────
+
+#[test]
+fn two_cell_position_width_emu_none() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[0].charts[0].position.as_ref().unwrap();
+    assert!(
+        pos.width_emu.is_none(),
+        "twoCellAnchor chart should not have width_emu"
+    );
+}
+
+#[test]
+fn two_cell_position_height_emu_none() {
+    let wb = extract_charts(&fixture()).unwrap();
+    let pos = wb.sheets[0].charts[0].position.as_ref().unwrap();
+    assert!(pos.height_emu.is_none());
+}
+
+// ── col_to_letter correctness ─────────────────────────────────────────────────
+
+#[test]
+fn col_letter_a() {
+    assert_eq!(ChartPosition::col_to_letter(0), "A");
+}
+#[test]
+fn col_letter_z() {
+    assert_eq!(ChartPosition::col_to_letter(25), "Z");
+}
+#[test]
+fn col_letter_aa() {
+    assert_eq!(ChartPosition::col_to_letter(26), "AA");
+}
+#[test]
+fn col_letter_ab() {
+    assert_eq!(ChartPosition::col_to_letter(27), "AB");
+}
+
+// ── cell_address correctness ──────────────────────────────────────────────────
+
+#[test]
+fn cell_address_a1() {
+    assert_eq!(ChartPosition::cell_address(0, 0), "A1");
+}
+#[test]
+fn cell_address_b2() {
+    assert_eq!(ChartPosition::cell_address(1, 1), "B2");
+}
+#[test]
+fn cell_address_z10() {
+    assert_eq!(ChartPosition::cell_address(25, 9), "Z10");
+}
+#[test]
+fn cell_address_aa1() {
+    assert_eq!(ChartPosition::cell_address(26, 0), "AA1");
+}
+
+// ── regression: all existing fixture charts have position ─────────────────────
+
+#[test]
+fn all_3d_charts_have_position() {
+    let wb = extract_charts(&fixture_3d()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert!(
+                chart.position.is_some(),
+                "3-D chart {} must have position",
+                chart.chart_path
+            );
+        }
+    }
+}
+
+#[test]
+fn all_surface_charts_have_position() {
+    let wb = extract_charts(&fixture_surface()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            assert!(
+                chart.position.is_some(),
+                "surface chart {} must have position",
+                chart.chart_path
+            );
+        }
+    }
+}
+
+#[test]
+fn position_sheet_matches_parent_sheet() {
+    // For every chart in every fixture, position.sheet must equal the
+    // SheetCharts name that owns it.
+    let wb = extract_charts(&fixture()).unwrap();
+    for sheet in &wb.sheets {
+        for chart in &sheet.charts {
+            if let Some(pos) = &chart.position {
+                assert_eq!(
+                    pos.sheet, sheet.name,
+                    "chart {} position.sheet must match parent sheet name",
+                    chart.chart_path
+                );
+            }
+        }
     }
 }
